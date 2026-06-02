@@ -1,0 +1,78 @@
+{
+ "actions": [],
+ "creation": "2026-05-25 23:00:00.000000",
+ "doctype": "DocType",
+ "document_type": "Other",
+ "engine": "InnoDB",
+ "issingle": 1,
+ "name": "SaaS Feature Config",
+ "module": "Paletixa SaaS",
+ "owner": "Administrator",
+ "editable_grid": 1,
+ "fields": [
+  {
+   "fieldname": "saas_features_section",
+   "fieldtype": "Section Break",
+   "label": "Módulos de Cliente"
+  },
+  {
+   "fieldname": "has_pos",
+   "fieldtype": "Check",
+   "label": "Punto de Venta (POS)",
+   "default": 0
+  },
+  {
+   "fieldname": "has_production",
+   "fieldtype": "Check",
+   "label": "Control de Producción",
+   "default": 0
+  },
+  {
+   "fieldname": "has_logistics",
+   "fieldtype": "Check",
+   "label": "Logística Avanzada",
+   "default": 0
+  },
+  {
+   "fieldname": "has_mexico_taxes",
+   "fieldtype": "Check",
+   "label": "Impuestos de México",
+   "default": 0
+  },
+  {
+   "fieldname": "saas_branding_section",
+   "fieldtype": "Section Break",
+   "label": "Branding de Marca Blanca"
+  },
+  {
+   "fieldname": "primary_color",
+   "fieldtype": "Color",
+   "label": "Color Primario",
+   "default": "#1abc9c"
+  },
+  {
+   "fieldname": "client_logo",
+   "fieldtype": "Attach Image",
+   "label": "Logo del Cliente"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-05-25 23:00:00.000000",
+ "modified_by": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "states": []
+}
