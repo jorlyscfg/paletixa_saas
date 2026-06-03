@@ -3086,18 +3086,37 @@ def seed_test_stock():
         return {"success": False, "message": "No se encontraron productos activos (variantes) para inyectar stock."}
         
     from frappe.utils import getdate
-    
-    # Cargar 500 unidades de cada producto en Fabrica - LP
+
+    # Calculate how much we need to transfer for each item to sucursal 1-4
+    transfer_needs = {item_code: 0.0 for item_code in items}
+    sucursales_transfers = {s: [] for s in range(1, 5)}
+    for s in range(1, 5):
+        target_wh = f"Sucursal {s} - LP"
+        for item_code in items:
+            current_target_qty = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": target_wh}, "actual_qty") or 0.0
+            if current_target_qty < 10.0:
+                qty_to_transfer = 100.0
+                sucursales_transfers[s].append({
+                    "item_code": item_code,
+                    "s_warehouse": "Fabrica - LP",
+                    "t_warehouse": target_wh,
+                    "qty": qty_to_transfer,
+                    "uom": "Unit"
+                })
+                transfer_needs[item_code] += qty_to_transfer
+
+    # Cargar stock en Fabrica - LP si no es suficiente para cubrir las transferencias
     items_to_receipt = []
     for item_code in items:
-        # Solo inyectar stock si actualmente está en 0
         current_qty = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": "Fabrica - LP"}, "actual_qty") or 0.0
-        if current_qty < 10.0:
+        needed = transfer_needs[item_code]
+        if current_qty < needed + 50.0:
             price = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": "Standard Selling"}, "price_list_rate") or 5.0
+            to_add = max(needed - current_qty + 50.0, 500.0)
             items_to_receipt.append({
                 "item_code": item_code,
                 "t_warehouse": "Fabrica - LP",
-                "qty": 500.0,
+                "qty": to_add,
                 "uom": "Unit",
                 "basic_rate": price
             })
@@ -3116,21 +3135,10 @@ def seed_test_stock():
         receipt.submit()
         receipt_name = receipt.name
         
-    # Transferir 100 unidades de cada producto de Fabrica - LP a Sucursal 1-4
+    # Realizar las transferencias a las sucursales
     transfers_created = []
     for s in range(1, 5):
-        target_wh = f"Sucursal {s} - LP"
-        items_to_transfer = []
-        for item_code in items:
-            current_target_qty = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": target_wh}, "actual_qty") or 0.0
-            if current_target_qty < 10.0:
-                items_to_transfer.append({
-                    "item_code": item_code,
-                    "s_warehouse": "Fabrica - LP",
-                    "t_warehouse": target_wh,
-                    "qty": 100.0,
-                    "uom": "Unit"
-                })
+        items_to_transfer = sucursales_transfers[s]
         if items_to_transfer:
             transfer = frappe.get_doc({
                 "doctype": "Stock Entry",
