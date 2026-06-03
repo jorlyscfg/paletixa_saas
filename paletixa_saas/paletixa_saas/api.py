@@ -1027,6 +1027,7 @@ def check_cart_availability(date):
         FROM `tabSales Order` so
         JOIN `tabSales Order Item` so_item ON so.name = so_item.parent
         WHERE (so.docstatus = 1 OR (so.docstatus = 0 AND so.advance_paid > 0))
+          AND so.status NOT IN ('Closed', 'Completed', 'Cancelled')
           AND so.delivery_date = %s
           AND so_item.item_code = %s
     """, (date, item_code))
@@ -1903,6 +1904,8 @@ def complete_event_booking(sales_order_name, register_payment=True, payment_mode
             pe.submit()
             advance_paid = outstanding
             
+        # 3. Cerrar el Sales Order de la reserva para liberar el carrito
+        so.db_set("status", "Completed")
         frappe.db.commit()
         
         updated_outstanding = float(frappe.db.get_value("Sales Invoice", si.name, "outstanding_amount") or 0.0)
