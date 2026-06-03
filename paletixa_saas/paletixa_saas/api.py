@@ -3069,15 +3069,129 @@ def create_or_update_user(email, first_name, last_name, roles, password=None, en
     frappe.db.commit()
     return {"success": True, "message": f"Usuario '{email}' guardado exitosamente."}
 
+@frappe.whitelist()
+def seed_test_stock():
+    if not frappe.session.user or frappe.session.user == "Guest":
+        frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+        
+    # Verificar que el usuario tenga rol de System Manager
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(frappe._("No tenés permisos para ejecutar esta acción"), frappe.PermissionError)
 
+    # 1. Definir items y almacenes
+    # Buscamos variantes activas de productos
+    items = frappe.get_all("Item", filters={"disabled": 0, "item_group": "Products", "has_variants": 0}, pluck="name")
+    
+    if not items:
+        return {"success": False, "message": "No se encontraron productos activos (variantes) para inyectar stock."}
+        
+    from frappe.utils import getdate
+    
+    # Cargar 500 unidades de cada producto en Fabrica - LP
+    items_to_receipt = []
+    for item_code in items:
+        # Solo inyectar stock si actualmente está en 0
+        current_qty = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": "Fabrica - LP"}, "actual_qty") or 0.0
+        if current_qty < 10.0:
+            price = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": "Standard Selling"}, "price_list_rate") or 5.0
+            items_to_receipt.append({
+                "item_code": item_code,
+                "t_warehouse": "Fabrica - LP",
+                "qty": 500.0,
+                "uom": "Unit",
+                "basic_rate": price
+            })
+            
+    receipt_name = None
+    if items_to_receipt:
+        receipt = frappe.get_doc({
+            "doctype": "Stock Entry",
+            "purpose": "Material Receipt",
+            "stock_entry_type": "Material Receipt",
+            "company": "La Paletixa",
+            "posting_date": getdate(),
+            "items": items_to_receipt
+        })
+        receipt.insert(ignore_permissions=True)
+        receipt.submit()
+        receipt_name = receipt.name
+        
+    # Transferir 100 unidades de cada producto de Fabrica - LP a Sucursal 1-4
+    transfers_created = []
+    for s in range(1, 5):
+        target_wh = f"Sucursal {s} - LP"
+        items_to_transfer = []
+        for item_code in items:
+            current_target_qty = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": target_wh}, "actual_qty") or 0.0
+            if current_target_qty < 10.0:
+                items_to_transfer.append({
+                    "item_code": item_code,
+                    "s_warehouse": "Fabrica - LP",
+                    "t_warehouse": target_wh,
+                    "qty": 100.0,
+                    "uom": "Unit"
+                })
+        if items_to_transfer:
+            transfer = frappe.get_doc({
+                "doctype": "Stock Entry",
+                "purpose": "Material Transfer",
+                "stock_entry_type": "Material Transfer",
+                "company": "La Paletixa",
+                "posting_date": getdate(),
+                "items": items_to_transfer
+            })
+            transfer.insert(ignore_permissions=True)
+            transfer.submit()
+            transfers_created.append(transfer.name)
+            
+    frappe.db.commit()
+    
+    return {
+        "success": True,
+        "message": f"¡Stock cargado con éxito! Entrada: {receipt_name or 'Ninguna (ya había stock)'}. Traspasos: {', '.join(transfers_created) or 'Ninguno'}"
+    }
 
-
-
-
-
-
-
-
-
-
-
+@frappe.whitelist()
+def fix_item_price_permissions():
+    if not frappe.session.user or frappe.session.user == "Guest":
+        frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+        
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+        
+    from frappe.permissions import setup_custom_perms
+    from frappe.core.doctype.doctype.doctype import validate_permissions_for_doctype
+    
+    item_price_perms = {
+        "Sales User": ["read"],
+        "Stock User": ["read"],
+        "Manufacturing User": ["read"],
+        "Stock Manager": ["read", "write", "create", "delete"],
+        "Sales Manager": ["read", "write", "create", "delete"],
+        "System Manager": ["read", "write", "create", "delete"]
+    }
+    
+    setup_custom_perms("Item Price")
+    for r_name, ptypes in item_price_perms.items():
+        perm_name = frappe.db.get_value("Custom DocPerm", dict(parent="Item Price", role=r_name, permlevel=0, if_owner=0))
+        if perm_name:
+            custom_docperm = frappe.get_doc("Custom DocPerm", perm_name)
+        else:
+            custom_docperm = frappe.get_doc({
+                "doctype": "Custom DocPerm",
+                "__islocal": 1,
+                "parent": "Item Price",
+                "parenttype": "DocType",
+                "parentfield": "permissions",
+                "role": r_name,
+                "permlevel": 0,
+            })
+        for p in ["read", "write", "create", "delete", "submit", "cancel", "amend"]:
+            custom_docperm.set(p, 0)
+        for pt in ptypes:
+            custom_docperm.set(pt, 1)
+        custom_docperm.save(ignore_permissions=True)
+        
+    validate_permissions_for_doctype("Item Price")
+    frappe.db.commit()
+    return {"success": True, "message": "Permisos de Item Price configurados con éxito."}
