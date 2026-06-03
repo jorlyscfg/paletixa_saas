@@ -437,6 +437,65 @@ def create_custom_variant(template_name, attribute_values, retail_price, wholesa
     try:
         # 1. Crear el documento variante de ERPNext
         variant_doc = create_variant(template_name, attribute_values)
+        item_code = variant_doc.item_code or variant_doc.name
+        
+        # Si el producto ya existe en la base de datos
+        if frappe.db.exists("Item", item_code):
+            existing_item = frappe.get_doc("Item", item_code)
+            if not existing_item.disabled:
+                frappe.throw(frappe._("El producto '{0}' ya existe y está activo.").format(item_code))
+            else:
+                # Si existe pero está inactivo, lo reactivamos
+                existing_item.disabled = 0
+                if image:
+                    existing_item.image = image
+                
+                if barcode:
+                    existing_item.set("barcodes", [])
+                    existing_item.append("barcodes", {
+                        "barcode": barcode.strip(),
+                        "uom": "Unit"
+                    })
+                
+                existing_item.save(ignore_permissions=True)
+                
+                # Actualizar o asignar precios
+                # Precio minorista (Standard Selling)
+                retail_price_name = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": "Standard Selling"}, "name")
+                if retail_price_name:
+                    frappe.db.set_value("Item Price", retail_price_name, "price_list_rate", retail_price)
+                else:
+                    p_retail = frappe.new_doc("Item Price")
+                    p_retail.price_list = "Standard Selling"
+                    p_retail.item_code = item_code
+                    p_retail.price_list_rate = retail_price
+                    p_retail.insert(ignore_permissions=True)
+                
+                # Precio mayorista (Standard Wholesale)
+                wholesale_price_name = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": "Standard Wholesale"}, "name")
+                if wholesale_price is not None:
+                    if wholesale_price_name:
+                        frappe.db.set_value("Item Price", wholesale_price_name, "price_list_rate", wholesale_price)
+                    else:
+                        p_wholesale = frappe.new_doc("Item Price")
+                        p_wholesale.price_list = "Standard Wholesale"
+                        p_wholesale.item_code = item_code
+                        p_wholesale.price_list_rate = wholesale_price
+                        p_wholesale.insert(ignore_permissions=True)
+                elif wholesale_price_name:
+                    frappe.delete_doc("Item Price", wholesale_price_name, ignore_permissions=True)
+                
+                frappe.db.commit()
+                frappe.clear_cache(doctype="Item")
+                frappe.clear_cache(doctype="Item Price")
+                
+                return {
+                    "success": True,
+                    "item_code": item_code,
+                    "item_name": existing_item.item_name,
+                    "retail_price": retail_price,
+                    "wholesale_price": wholesale_price
+                }
         
         # Sobrescribir UOM estándar de ERPNext a "Unit"
         variant_doc.stock_uom = "Unit"
@@ -452,7 +511,6 @@ def create_custom_variant(template_name, attribute_values, retail_price, wholesa
             
         # Insertar en la base de datos
         variant_doc.insert(ignore_permissions=True)
-        item_code = variant_doc.item_code
         
         # 2. Asignar precio minorista (Standard Selling)
         p_retail = frappe.new_doc("Item Price")
