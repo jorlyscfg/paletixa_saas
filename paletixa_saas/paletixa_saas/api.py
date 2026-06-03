@@ -1,6 +1,11 @@
 import frappe
 
 def setup_company_identity_fields():
+    # Evitar consultas redundantes usando la caché de Redis por sitio
+    cache_key = f"saas_fields_setup_done:{frappe.local.site}"
+    if frappe.cache().get_value(cache_key):
+        return
+
     fields = [
         {
             "fieldname": "company_name",
@@ -99,6 +104,8 @@ def setup_company_identity_fields():
     if created:
         frappe.db.commit()
         frappe.clear_cache(doctype="SaaS Feature Config")
+    
+    frappe.cache().set_value(cache_key, 1)
 
 @frappe.whitelist(allow_guest=True)
 def get_features():
