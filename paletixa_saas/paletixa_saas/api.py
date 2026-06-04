@@ -3367,3 +3367,126 @@ def fix_item_price_permissions():
     validate_permissions_for_doctype("Item Price")
     frappe.db.commit()
     return {"success": True, "message": "Permisos de Item Price configurados con éxito."}
+
+@frappe.whitelist()
+def get_pos_shifts(start_date=None, end_date=None):
+    if not frappe.session.user or frappe.session.user == "Guest":
+        frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+        
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(frappe._("No tenés permisos para acceder a esta información"), frappe.PermissionError)
+        
+    # Query POS Opening Entries (each opening entry represents a shift)
+    filters = {}
+    if start_date:
+        filters["posting_date"] = [">=", start_date]
+    if end_date:
+        if "posting_date" in filters:
+            filters["posting_date"] = ["between", [start_date, end_date]]
+        else:
+            filters["posting_date"] = ["<=", end_date]
+            
+    openings = frappe.get_all("POS Opening Entry", 
+        filters=filters, 
+        fields=["name", "user", "pos_profile", "posting_date", "period_start_date", "status", "pos_closing_entry"],
+        order_by="period_start_date desc",
+        limit=100
+    )
+    
+    shifts = []
+    for ope in openings:
+        start = ope.period_start_date
+        end = None
+        closing_details = []
+        grand_total = 0.0
+        
+        if ope.status == "Closed" and ope.pos_closing_entry:
+            closing_doc = frappe.db.get_value("POS Closing Entry", ope.pos_closing_entry, ["period_end_date", "grand_total"], as_dict=True)
+            if closing_doc:
+                end = closing_doc.period_end_date
+                grand_total = closing_doc.grand_total
+            
+            # Fetch payment reconciliation details
+            reconciliation = frappe.get_all("POS Closing Entry Detail", 
+                filters={"parent": ope.pos_closing_entry},
+                fields=["mode_of_payment", "opening_amount", "expected_amount", "closing_amount", "difference"]
+            )
+            closing_details = reconciliation
+        else:
+            end = frappe.utils.now_datetime()
+            try:
+                closing_details = get_closing_reconciliation_details(ope.name)
+            except Exception:
+                closing_details = []
+                
+        # Find all Sales Invoices created during this shift
+        invoices = frappe.get_all("Sales Invoice",
+            filters={
+                "owner": ope.user,
+                "pos_profile": ope.pos_profile,
+                "creation": ["between", [start, end]],
+                "docstatus": ["!=", 2]
+            },
+            fields=["name", "creation", "customer_name", "grand_total", "remarks", "docstatus"]
+        )
+        
+        sales_count = len(invoices)
+        sales_total = sum(inv.grand_total for inv in invoices)
+        
+        usd_sales_count = 0
+        usd_amount_collected = 0.0
+        usd_invoices = []
+        
+        import re
+        for inv in invoices:
+            if inv.remarks and "[Pago USD]" in inv.remarks:
+                usd_amt = 0.0
+                tc = 0.0
+                cambio = 0.0
+                try:
+                    match_recibido = re.search(r"Recibido:\s*\$(\d+(\.\d+)?)\s*USD", inv.remarks)
+                    match_tc = re.search(r"TC:\s*(\d+(\.\d+)?)\s*MXN", inv.remarks)
+                    match_cambio = re.search(r"Cambio:\s*\$(\d+(\.\d+)?)\s*MXN", inv.remarks)
+                    
+                    if match_recibido:
+                        usd_amt = float(match_recibido.group(1))
+                    if match_tc:
+                        tc = float(match_tc.group(1))
+                    if match_cambio:
+                        cambio = float(match_cambio.group(1))
+                except Exception:
+                    pass
+                
+                usd_sales_count += 1
+                usd_amount_collected += usd_amt
+                usd_invoices.append({
+                    "name": inv.name,
+                    "creation": inv.creation,
+                    "customer_name": inv.customer_name,
+                    "grand_total": inv.grand_total,
+                    "usd_amount": usd_amt,
+                    "exchange_rate": tc,
+                    "change_due": cambio,
+                    "remarks": inv.remarks
+                })
+        
+        shifts.append({
+            "opening_entry": ope.name,
+            "closing_entry": ope.pos_closing_entry,
+            "user": ope.user,
+            "pos_profile": ope.pos_profile,
+            "period_start_date": start,
+            "period_end_date": end,
+            "status": ope.status,
+            "grand_total": grand_total or sales_total,
+            "sales_count": sales_count,
+            "sales_total": sales_total,
+            "usd_sales_count": usd_sales_count,
+            "usd_amount_collected": usd_amount_collected,
+            "usd_invoices": usd_invoices,
+            "closing_details": closing_details,
+            "invoices": [{"name": i.name, "creation": i.creation, "customer_name": i.customer_name, "grand_total": i.grand_total, "remarks": i.remarks, "docstatus": i.docstatus} for i in invoices]
+        })
+        
+    return {"success": True, "shifts": shifts}
+
