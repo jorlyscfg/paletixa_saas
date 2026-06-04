@@ -2356,6 +2356,102 @@ def get_stock_report_data():
     }
 
 
+@frappe.whitelist()
+def get_audit_report_data(start_date=None, end_date=None, limit=100):
+    if not frappe.session.user or frappe.session.user == "Guest":
+        frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+        
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(frappe._("No tenés permisos para acceder a esta información de reportes."), frappe.PermissionError)
+        
+    if not start_date:
+        start_date = frappe.utils.add_months(frappe.utils.today(), -1)
+    if not end_date:
+        end_date = frappe.utils.today()
+        
+    company = frappe.defaults.get_global_default("company") or "La Paletixa"
+    company_abbr = frappe.db.get_value("Company", company, "abbr") or "LP"
+    suffix = f" - {company_abbr}"
+    
+    # 1. Obtener movimientos de stock (Stock Ledger Entry)
+    stock_moves = frappe.db.sql("""
+        SELECT 
+            sle.name,
+            sle.creation as timestamp,
+            sle.item_code,
+            (SELECT item_name FROM `tabItem` WHERE name = sle.item_code) as item_name,
+            sle.warehouse,
+            sle.actual_qty,
+            sle.voucher_type,
+            sle.voucher_no,
+            (SELECT owner FROM `tabStock Ledger Entry` WHERE name = sle.name) as user
+        FROM `tabStock Ledger Entry` sle
+        WHERE DATE(sle.posting_date) BETWEEN %s AND %s AND sle.company = %s
+        ORDER BY sle.creation DESC
+        LIMIT %s
+    """, (start_date, end_date, company, frappe.utils.cint(limit)), as_dict=1)
+    
+    for move in stock_moves:
+        move["timestamp"] = str(move["timestamp"])
+        move["actual_qty"] = float(move["actual_qty"])
+        if move.get("warehouse"):
+            move["branch"] = move["warehouse"].replace(suffix, "")
+        else:
+            move["branch"] = "Desconocido"
+        
+    # 2. Obtener historial de facturación de ventas (Sales Invoices)
+    sales_moves = frappe.db.sql("""
+        SELECT 
+            name,
+            creation as timestamp,
+            customer_name,
+            grand_total as amount,
+            docstatus,
+            owner as user,
+            'Sales Invoice' as voucher_type
+        FROM `tabSales Invoice`
+        WHERE DATE(posting_date) BETWEEN %s AND %s AND company = %s
+        ORDER BY creation DESC
+        LIMIT %s
+    """, (start_date, end_date, company, frappe.utils.cint(limit)), as_dict=1)
+    
+    for sale in sales_moves:
+        sale["timestamp"] = str(sale["timestamp"])
+        sale["amount"] = float(sale["amount"])
+        
+    # 3. Obtener historial de modificaciones críticas (tabVersion)
+    version_logs = frappe.db.sql("""
+        SELECT 
+            name,
+            creation as timestamp,
+            ref_doctype as voucher_type,
+            docname as voucher_no,
+            owner as user,
+            data
+        FROM `tabVersion`
+        WHERE ref_doctype IN ('Sales Invoice', 'Stock Entry', 'Price List', 'Item Price', 'Warehouse')
+          AND DATE(creation) BETWEEN %s AND %s
+        ORDER BY creation DESC
+        LIMIT %s
+    """, (start_date, end_date, frappe.utils.cint(limit)), as_dict=1)
+    
+    for log in version_logs:
+        log["timestamp"] = str(log["timestamp"])
+        try:
+            import json
+            log["data_diff"] = json.loads(log["data"]) if log.get("data") else None
+        except Exception:
+            log["data_diff"] = None
+        log.pop("data", None)
+        
+    return {
+        "success": True,
+        "stock_moves": stock_moves,
+        "sales_moves": sales_moves,
+        "version_logs": version_logs
+    }
+
+
 def setup_mexican_taxes_and_fields(company_name):
     # 1. Asegurar cuentas contables para IVA
     company_abbr = frappe.db.get_value("Company", company_name, "abbr") or "LP"
