@@ -3430,6 +3430,24 @@ def get_pos_shifts(start_date=None, end_date=None):
             fields=["name", "creation", "customer_name", "grand_total", "remarks", "docstatus"]
         )
         
+        invoice_items_map = {}
+        if invoices:
+            invoice_names = [inv.name for inv in invoices]
+            items = frappe.get_all("Sales Invoice Item",
+                filters={"parent": ["in", invoice_names]},
+                fields=["parent", "item_code", "item_name", "qty", "rate", "amount"]
+            )
+            for item in items:
+                if item.parent not in invoice_items_map:
+                    invoice_items_map[item.parent] = []
+                invoice_items_map[item.parent].append({
+                    "item_code": item.item_code,
+                    "item_name": item.item_name,
+                    "qty": item.qty,
+                    "rate": item.rate,
+                    "amount": item.amount
+                })
+        
         sales_count = len(invoices)
         sales_total = sum(inv.grand_total for inv in invoices)
         
@@ -3485,7 +3503,15 @@ def get_pos_shifts(start_date=None, end_date=None):
             "usd_amount_collected": usd_amount_collected,
             "usd_invoices": usd_invoices,
             "closing_details": closing_details,
-            "invoices": [{"name": i.name, "creation": i.creation, "customer_name": i.customer_name, "grand_total": i.grand_total, "remarks": i.remarks, "docstatus": i.docstatus} for i in invoices]
+            "invoices": [{
+                "name": i.name,
+                "creation": i.creation,
+                "customer_name": i.customer_name,
+                "grand_total": i.grand_total,
+                "remarks": i.remarks,
+                "docstatus": i.docstatus,
+                "items": invoice_items_map.get(i.name, [])
+            } for i in invoices]
         })
         
     return {"success": True, "shifts": shifts}
