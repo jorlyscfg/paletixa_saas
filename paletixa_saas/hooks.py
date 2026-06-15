@@ -205,7 +205,7 @@ app_license = "mit"
 
 # Request Events
 # ----------------
-# before_request = ["paletixa_saas.utils.before_request"]
+before_request = ["paletixa_saas.paletixa_saas.api.validate_tenant_is_active"]
 # after_request = ["paletixa_saas.utils.after_request"]
 
 # Job Events
@@ -259,9 +259,39 @@ app_license = "mit"
 
 doc_events = {
 	"Item": {
-		"before_save": "paletixa_saas.paletixa_saas.api.clean_old_image_file"
+		"before_save": [
+			"paletixa_saas.paletixa_saas.api.clean_old_image_file",
+			"paletixa_saas.paletixa_saas.api.validate_item_type",
+		]
 	},
-	"Sales Order": {
-		"after_insert": "paletixa_saas.paletixa_saas.api.create_notification_on_order"
-	}
+	"Sales Order": {"after_insert": "paletixa_saas.paletixa_saas.api.create_notification_on_order"},
+	"Stock Entry": {"before_save": "paletixa_saas.paletixa_saas.api.validate_product_features_enabled"},
+	"Delivery Note": {"before_save": "paletixa_saas.paletixa_saas.api.validate_product_features_enabled"},
+	"Purchase Receipt": {"before_save": "paletixa_saas.paletixa_saas.api.validate_product_features_enabled"},
+	"Purchase Order": {"before_save": "paletixa_saas.paletixa_saas.api.validate_purchasing_features_enabled"},
+	"Timesheet": {"before_save": "paletixa_saas.paletixa_saas.api.validate_service_features_enabled"},
+	"Maintenance Visit": {"before_save": "paletixa_saas.paletixa_saas.api.validate_service_features_enabled"},
+	"Issue": {"before_save": "paletixa_saas.paletixa_saas.api.validate_service_features_enabled"},
 }
+
+has_permission = {
+	"Timesheet": "paletixa_saas.paletixa_saas.api.has_services_permission",
+	"Maintenance Visit": "paletixa_saas.paletixa_saas.api.has_services_permission",
+	"Issue": "paletixa_saas.paletixa_saas.api.has_services_permission",
+	"Stock Entry": "paletixa_saas.paletixa_saas.api.has_products_permission",
+	"Delivery Note": "paletixa_saas.paletixa_saas.api.has_products_permission",
+	"Purchase Receipt": "paletixa_saas.paletixa_saas.api.has_products_permission",
+	"Purchase Order": "paletixa_saas.paletixa_saas.api.has_purchasing_permission",
+}
+
+permission_query_conditions = {
+	"Timesheet": "paletixa_saas.paletixa_saas.api.get_services_permission_query_conditions",
+	"Maintenance Visit": "paletixa_saas.paletixa_saas.api.get_services_permission_query_conditions",
+	"Issue": "paletixa_saas.paletixa_saas.api.get_services_permission_query_conditions",
+	"Stock Entry": "paletixa_saas.paletixa_saas.api.get_products_permission_query_conditions",
+	"Delivery Note": "paletixa_saas.paletixa_saas.api.get_products_permission_query_conditions",
+	"Purchase Receipt": "paletixa_saas.paletixa_saas.api.get_products_permission_query_conditions",
+	"Purchase Order": "paletixa_saas.paletixa_saas.api.get_purchasing_permission_query_conditions",
+}
+
+scheduler_events = {"daily": ["paletixa_saas.paletixa_saas.api.daily_tenant_billing_check"]}

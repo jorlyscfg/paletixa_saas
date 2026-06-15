@@ -40,6 +40,24 @@
    "default": 0
   },
   {
+   "fieldname": "has_services",
+   "fieldtype": "Check",
+   "label": "Habilitar Servicios",
+   "default": 1
+  },
+  {
+   "fieldname": "has_products",
+   "fieldtype": "Check",
+   "label": "Habilitar Productos",
+   "default": 1
+  },
+  {
+   "fieldname": "has_purchasing",
+   "fieldtype": "Check",
+   "label": "Habilitar Compras",
+   "default": 0
+  },
+  {
    "fieldname": "saas_branding_section",
    "fieldtype": "Section Break",
    "label": "Branding de Marca Blanca"
@@ -54,6 +72,18 @@
    "fieldname": "client_logo",
    "fieldtype": "Attach Image",
    "label": "Logo del Cliente"
+  },
+  {
+   "fieldname": "is_active",
+   "fieldtype": "Check",
+   "label": "Activo",
+   "default": 1
+  },
+  {
+   "fieldname": "max_branches",
+   "fieldtype": "Int",
+   "label": "Límite de Sucursales",
+   "default": 3
   }
  ],
  "index_web_pages_for_search": 1,

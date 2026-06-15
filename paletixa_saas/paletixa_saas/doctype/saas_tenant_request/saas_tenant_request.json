@@ -1,0 +1,115 @@
+{
+ "actions": [],
+ "autoname": "field:subdomain",
+ "creation": "2026-06-11 14:30:00.000000",
+ "doctype": "DocType",
+ "document_type": "Other",
+ "engine": "InnoDB",
+ "issingle": 0,
+ "name": "SaaS Tenant Request",
+ "module": "Paletixa SaaS",
+ "owner": "Administrator",
+ "editable_grid": 1,
+ "fields": [
+  {
+   "fieldname": "subdomain",
+   "fieldtype": "Data",
+   "label": "Subdominio",
+   "unique": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "company_name",
+   "fieldtype": "Data",
+   "label": "Nombre de la Empresa",
+   "reqd": 1
+  },
+  {
+   "fieldname": "admin_email",
+   "fieldtype": "Data",
+   "label": "Email del Administrador",
+   "reqd": 1
+  },
+  {
+   "fieldname": "admin_password",
+   "fieldtype": "Password",
+   "label": "Contraseña del Administrador",
+   "reqd": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Estado",
+   "options": "Pending\nIn Progress\nCompleted\nFailed",
+   "default": "Pending",
+   "read_only": 1
+  },
+  {
+   "fieldname": "database_name",
+   "fieldtype": "Data",
+   "label": "Nombre de Base de Datos",
+   "read_only": 1
+  },
+   {
+    "fieldname": "error_log",
+    "fieldtype": "Long Text",
+    "label": "Log de Errores",
+    "read_only": 1
+   },
+   {
+    "fieldname": "status_token",
+    "fieldtype": "Data",
+    "label": "Token de Estado",
+    "read_only": 1
+   },
+   {
+    "fieldname": "active",
+    "fieldtype": "Check",
+   "label": "Activo",
+   "default": 1
+  },
+  {
+   "fieldname": "max_branches",
+   "fieldtype": "Int",
+   "label": "Límite de Sucursales",
+   "default": 3
+  },
+  {
+   "fieldname": "exempt_from_payment",
+   "fieldtype": "Check",
+   "label": "Exento de Pago",
+   "default": 0
+  },
+  {
+   "fieldname": "last_payment_date",
+   "fieldtype": "Date",
+   "label": "Fecha de Último Pago",
+   "read_only": 1
+  },
+  {
+   "fieldname": "expiration_date",
+   "fieldtype": "Date",
+   "label": "Fecha de Vencimiento",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-06-11 14:30:00.000000",
+ "modified_by": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "states": []
+}
