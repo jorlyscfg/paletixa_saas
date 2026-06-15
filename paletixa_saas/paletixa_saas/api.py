@@ -1,3 +1,6 @@
+import json
+import traceback
+
 import frappe
 
 from paletixa_saas.config.infrastructure import (
@@ -25,7 +28,7 @@ from paletixa_saas.config.platform_defaults import (
 
 def setup_company_identity_fields():
 	# Evitar consultas redundantes usando la caché de Redis por sitio
-	cache_key = f"saas_fields_setup_done:{frappe.local.site}"
+	cache_key = f"saas_fields_setup_done:v2:{frappe.local.site}"
 	if frappe.cache().get_value(cache_key):
 		return
 
@@ -150,6 +153,7 @@ def setup_company_identity_fields():
 					"fieldname": f["fieldname"],
 					"label": f["label"],
 					"fieldtype": f["fieldtype"],
+					**({"options": f["options"]} if f.get("options") else {}),
 					"insert_after": f["insert_after"],
 					"default": f["default"],
 				}
@@ -392,6 +396,7 @@ def update_saas_config(
 	# Asegurar que existan los campos de marca
 	setup_company_identity_fields()
 	config = frappe.get_doc("SaaS Feature Config")
+	effective_company_name = (company_name or "").strip() or get_platform_company_name()
 
 	if primary_color is not None:
 		config.primary_color = primary_color
@@ -421,29 +426,35 @@ def update_saas_config(
 		config.reservation_item_code = reservation_item_code
 
 	if max_reservation_assets is not None:
-		new_max = int(max_reservation_assets)
-		is_res_active = (has_reservations is not None and int(has_reservations)) or (
-			has_reservations is None and bool(config.has_reservations)
-		)
-		if is_res_active:
-			company_name_default = get_platform_company_name()
-			sync_event_warehouses(company_name_default, new_max)
-		config.max_reservation_assets = new_max
+		current_max_raw = config.get("max_reservation_assets")
+		try:
+			current_max = int(current_max_raw or 0)
+		except (TypeError, ValueError):
+			current_max = 0
+		try:
+			new_max = int(max_reservation_assets)
+		except (TypeError, ValueError):
+			new_max = current_max
+		else:
+			is_res_active = (has_reservations is not None and int(has_reservations)) or (
+				has_reservations is None and bool(config.has_reservations)
+			)
+			if is_res_active:
+				sync_event_warehouses(effective_company_name, new_max)
+			config.max_reservation_assets = new_max
 
 	if default_event_items is not None:
 		config.default_event_items = default_event_items
 
 	if custom_country is not None:
 		config.custom_country = custom_country
-		company_name_default = get_platform_company_name()
-		if frappe.db.exists("Company", company_name_default):
-			frappe.db.set_value("Company", company_name_default, "country", custom_country)
+		if frappe.db.exists("Company", effective_company_name):
+			frappe.db.set_value("Company", effective_company_name, "country", custom_country)
 
 	if custom_currency is not None:
 		config.custom_currency = custom_currency
-		company_name_default = get_platform_company_name()
-		if frappe.db.exists("Company", company_name_default):
-			frappe.db.set_value("Company", company_name_default, "default_currency", custom_currency)
+		if frappe.db.exists("Company", effective_company_name):
+			frappe.db.set_value("Company", effective_company_name, "default_currency", custom_currency)
 		for pl in ["Standard Selling", "Standard Wholesale"]:
 			if frappe.db.exists("Price List", pl):
 				frappe.db.set_value("Price List", pl, "currency", custom_currency)
@@ -488,8 +499,7 @@ def update_saas_config(
 	if has_mexico_taxes is not None:
 		config.has_mexico_taxes = int(has_mexico_taxes)
 		if int(has_mexico_taxes) == 1:
-			company_name_default = get_platform_company_name()
-			setup_mexican_taxes_and_fields(company_name_default)
+			setup_mexican_taxes_and_fields(effective_company_name)
 
 	if has_purchasing is not None:
 		config.has_purchasing = int(has_purchasing)
@@ -2855,6 +2865,70 @@ def get_audit_report_data(start_date=None, end_date=None, limit=100):
 	}
 
 
+def _get_first_existing_tax_parent(company_abbr, parent_prefixes):
+	for parent_prefix in parent_prefixes:
+		parent_name = f"{parent_prefix} - {company_abbr}"
+		if frappe.db.exists("Account", parent_name):
+			return parent_name
+	return None
+
+
+def _ensure_mexican_tax_account(account_label, company_name, company_abbr, parent_prefixes):
+	account_name = f"{account_label} - {company_abbr}"
+	if frappe.db.exists("Account", account_name):
+		return account_name
+
+	parent_account = _get_first_existing_tax_parent(company_abbr, parent_prefixes)
+	if not parent_account:
+		available_parents = ", ".join(f"{prefix} - {company_abbr}" for prefix in parent_prefixes)
+		frappe.logger("paletixa_saas").warning(
+			frappe._(
+				"Se omitió la cuenta {0} porque no se encontró ningún padre disponible entre: {1}"
+			).format(account_name, available_parents)
+		)
+		return None
+
+	doc = frappe.new_doc("Account")
+	doc.account_name = account_label
+	doc.parent_account = parent_account
+	doc.company = company_name
+	doc.account_type = "Tax"
+	doc.insert(ignore_permissions=True)
+	return doc.name
+
+
+def _ensure_mexican_tax_template(doctype, template_name, company_name, company_abbr, account_head, description):
+	if not account_head:
+		frappe.logger("paletixa_saas").warning(
+			frappe._("Se omitió la plantilla {0} porque no existe una cuenta contable válida.").format(
+				template_name
+			)
+		)
+		return
+
+	template_candidates = [template_name]
+	if company_abbr:
+		template_candidates.insert(0, f"{template_name} - {company_abbr}")
+	for candidate in template_candidates:
+		if frappe.db.exists(doctype, candidate):
+			return candidate
+
+	doc = frappe.new_doc(doctype)
+	doc.title = template_name
+	doc.company = company_name
+	doc.is_default = 1
+	doc.append(
+		"taxes",
+		{
+			"charge_type": "On Net Total",
+			"account_head": account_head,
+			"description": description,
+			"rate": 16.0,
+		},
+	)
+	doc.insert(ignore_permissions=True)
+
+
 def setup_mexican_taxes_and_fields(company_name):
 	# 1. Asegurar cuentas contables para IVA
 	try:
@@ -2869,66 +2943,44 @@ def setup_mexican_taxes_and_fields(company_name):
 		)
 
 	# Cuenta de IVA Cobrado (Pasivo Directo)
-	iva_cobrado_name = f"IVA 16% Cobrado - {company_abbr}"
-	if not frappe.db.exists("Account", iva_cobrado_name):
-		parent_acc = f"Direct Liabilities - {company_abbr}"
-		if frappe.db.exists("Account", parent_acc):
-			doc = frappe.new_doc("Account")
-			doc.account_name = "IVA 16% Cobrado"
-			doc.parent_account = parent_acc
-			doc.company = company_name
-			doc.account_type = "Tax"
-			doc.insert(ignore_permissions=True)
+	iva_cobrado_name = _ensure_mexican_tax_account(
+		"IVA 16% Cobrado",
+		company_name,
+		company_abbr,
+		("Current Liabilities", "Direct Liabilities"),
+	)
 
 	# Cuenta de IVA Pagado (Activo Circulante)
-	iva_pagado_name = f"IVA 16% Pagado - {company_abbr}"
-	if not frappe.db.exists("Account", iva_pagado_name):
-		parent_acc = f"Current Assets - {company_abbr}"
-		if frappe.db.exists("Account", parent_acc):
-			doc = frappe.new_doc("Account")
-			doc.account_name = "IVA 16% Pagado"
-			doc.parent_account = parent_acc
-			doc.company = company_name
-			doc.account_type = "Tax"
-			doc.insert(ignore_permissions=True)
+	iva_pagado_name = _ensure_mexican_tax_account(
+		"IVA 16% Pagado",
+		company_name,
+		company_abbr,
+		("Current Assets", "Direct Assets"),
+	)
 
 	frappe.db.commit()
 
 	# 2. Crear Plantilla de Impuestos de Venta (IVA 16%)
 	template_name = "IVA 16% México"
-	if not frappe.db.exists("Sales Taxes and Charges Template", template_name):
-		doc = frappe.new_doc("Sales Taxes and Charges Template")
-		doc.title = template_name
-		doc.company = company_name
-		doc.is_default = 1
-		doc.append(
-			"taxes",
-			{
-				"charge_type": "On Net Total",
-				"account_head": iva_cobrado_name,
-				"description": "IVA 16%",
-				"rate": 16.0,
-			},
-		)
-		doc.insert(ignore_permissions=True)
+	_ensure_mexican_tax_template(
+		"Sales Taxes and Charges Template",
+		template_name,
+		company_name,
+		company_abbr,
+		iva_cobrado_name,
+		"IVA 16%",
+	)
 
 	# 3. Crear Plantilla de Impuestos de Compra (IVA 16% Compras)
 	purchase_template_name = "IVA 16% México Compras"
-	if not frappe.db.exists("Purchase Taxes and Charges Template", purchase_template_name):
-		doc = frappe.new_doc("Purchase Taxes and Charges Template")
-		doc.title = purchase_template_name
-		doc.company = company_name
-		doc.is_default = 1
-		doc.append(
-			"taxes",
-			{
-				"charge_type": "On Net Total",
-				"account_head": iva_pagado_name,
-				"description": "IVA 16% Compras",
-				"rate": 16.0,
-			},
-		)
-		doc.insert(ignore_permissions=True)
+	_ensure_mexican_tax_template(
+		"Purchase Taxes and Charges Template",
+		purchase_template_name,
+		company_name,
+		company_abbr,
+		iva_pagado_name,
+		"IVA 16% Compras",
+	)
 
 	frappe.db.commit()
 

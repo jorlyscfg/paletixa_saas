@@ -30,6 +30,219 @@ class _FakeDoc:
 		self.docstatus = 2
 
 
+class _FakeSaaSConfig:
+	def __init__(self):
+		self.primary_color = ""
+		self.has_pos = 0
+		self.has_production = 0
+		self.has_logistics = 0
+		self.has_reservations = 1
+		self.has_wholesale = 1
+		self.has_services = 1
+		self.has_products = 1
+		self.has_mexico_taxes = 0
+		self.has_purchasing = 0
+		self.reservation_item_code = ""
+		self.max_reservation_assets = 0
+		self.default_event_items = "[]"
+		self.custom_country = ""
+		self.custom_currency = ""
+		self.company_name = ""
+		self.company_abbr = ""
+		self.default_distribution_warehouse = ""
+		self.default_cash_account = ""
+		self.default_bank_account = ""
+		self.company_logo = ""
+		self.client_logo = ""
+		self.company_tax_id = ""
+		self.company_address = ""
+		self.company_phone = ""
+		self.company_email = ""
+		self.ticket_header = ""
+		self.ticket_footer = ""
+		self.print_logo = 1
+		self.print_tax_id = 1
+		self.print_address = 1
+		self.print_contact = 1
+
+	def get(self, key, default=None):
+		return getattr(self, key, default)
+
+	def save(self, ignore_permissions=False):
+		return self
+
+	def as_dict(self):
+		return dict(self.__dict__)
+
+
+class _RecordingDoc:
+	def __init__(self, doctype):
+		self.doctype = doctype
+		self._children = {}
+
+	def append(self, table, row):
+		self._children.setdefault(table, []).append(row)
+
+	def insert(self, ignore_permissions=False):
+		return self
+
+
+def test_update_saas_config_uses_incoming_company_name_for_reservations():
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_get_doc = frappe.get_doc
+	original_exists = frappe.db.exists
+	original_commit = frappe.db.commit
+	original_clear_cache = frappe.clear_cache
+	original_setup_fields = saas_api.setup_company_identity_fields
+	original_sync_warehouses = saas_api.sync_event_warehouses
+
+	fake_config = _FakeSaaSConfig()
+	sync_calls = []
+
+	try:
+		frappe.session.user = "Administrator"
+		frappe.get_roles = lambda user=None: ["System Manager"]
+		frappe.get_doc = lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else None
+		frappe.db.exists = lambda doctype, name=None, *args, **kwargs: False
+		frappe.db.commit = lambda *args, **kwargs: None
+		frappe.clear_cache = lambda *args, **kwargs: None
+		saas_api.setup_company_identity_fields = lambda: None
+		saas_api.sync_event_warehouses = lambda company_name, max_assets: sync_calls.append((company_name, max_assets))
+
+		result = saas_api.update_saas_config(
+			company_name="Nueva Plataforma",
+			max_reservation_assets=7,
+		)
+
+		assert result["success"] is True
+		assert sync_calls == [("Nueva Plataforma", 7)]
+		assert fake_config.company_name == "Nueva Plataforma"
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		frappe.get_doc = original_get_doc
+		frappe.db.exists = original_exists
+		frappe.db.commit = original_commit
+		frappe.clear_cache = original_clear_cache
+		saas_api.setup_company_identity_fields = original_setup_fields
+		saas_api.sync_event_warehouses = original_sync_warehouses
+
+
+def test_update_saas_config_ignores_invalid_max_reservation_assets():
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_get_doc = frappe.get_doc
+	original_exists = frappe.db.exists
+	original_commit = frappe.db.commit
+	original_clear_cache = frappe.clear_cache
+	original_setup_fields = saas_api.setup_company_identity_fields
+	original_sync_warehouses = saas_api.sync_event_warehouses
+
+	fake_config = _FakeSaaSConfig()
+	fake_config.max_reservation_assets = 5
+	sync_calls = []
+
+	try:
+		frappe.session.user = "Administrator"
+		frappe.get_roles = lambda user=None: ["System Manager"]
+		frappe.get_doc = lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else None
+		frappe.db.exists = lambda doctype, name=None, *args, **kwargs: False
+		frappe.db.commit = lambda *args, **kwargs: None
+		frappe.clear_cache = lambda *args, **kwargs: None
+		saas_api.setup_company_identity_fields = lambda: None
+		saas_api.sync_event_warehouses = lambda company_name, max_assets: sync_calls.append((company_name, max_assets))
+
+		result = saas_api.update_saas_config(
+			company_name="Nueva Plataforma",
+			max_reservation_assets="x",
+		)
+
+		assert result["success"] is True
+		assert sync_calls == []
+		assert fake_config.max_reservation_assets == 5
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		frappe.get_doc = original_get_doc
+		frappe.db.exists = original_exists
+		frappe.db.commit = original_commit
+		frappe.clear_cache = original_clear_cache
+		saas_api.setup_company_identity_fields = original_setup_fields
+		saas_api.sync_event_warehouses = original_sync_warehouses
+
+
+def test_setup_mexican_taxes_falls_back_when_direct_liabilities_missing():
+	original_get_cached_doc = frappe.get_cached_doc
+	original_exists = frappe.db.exists
+	original_new_doc = frappe.new_doc
+	original_commit = frappe.db.commit
+	original_logger = frappe.logger
+
+	created_accounts = []
+	created_templates = []
+	logger_messages = []
+	fake_logger = type(
+		"_FakeLogger",
+		(),
+		{"warning": lambda self, message: logger_messages.append(message)},
+	)()
+
+	class _FakeCompany:
+		abbr = "LP"
+
+	def _fake_get_cached_doc(doctype, name=None, *args, **kwargs):
+		if doctype == "Company" and name == "La Paletixa":
+			return _FakeCompany()
+		raise AssertionError(f"Unexpected cached doc lookup: {doctype} {name}")
+
+	def _fake_exists(doctype, name=None, *args, **kwargs):
+		if doctype == "Account":
+			return name in {"Current Liabilities - LP", "Current Assets - LP"}
+		if doctype in {"Sales Taxes and Charges Template", "Purchase Taxes and Charges Template", "Custom Field"}:
+			return False
+		if doctype == "Company":
+			return name == "La Paletixa"
+		return False
+
+	def _fake_new_doc(doctype):
+		doc = _RecordingDoc(doctype)
+
+		def _insert(ignore_permissions=False):
+			if doctype == "Account":
+				doc.name = f"{doc.account_name} - LP"
+				created_accounts.append((doc.name, doc.parent_account, doc.company, doc.account_type))
+			elif doctype in {"Sales Taxes and Charges Template", "Purchase Taxes and Charges Template"}:
+				created_templates.append(
+					(doctype, doc.title, doc._children.get("taxes", [{}])[0].get("account_head"))
+				)
+			return doc
+
+		doc.insert = _insert
+		return doc
+
+	try:
+		frappe.get_cached_doc = _fake_get_cached_doc
+		frappe.db.exists = _fake_exists
+		frappe.new_doc = _fake_new_doc
+		frappe.db.commit = lambda *args, **kwargs: None
+		frappe.logger = lambda name=None: fake_logger
+
+		saas_api.setup_mexican_taxes_and_fields("La Paletixa")
+
+		assert ("IVA 16% Cobrado - LP", "Current Liabilities - LP", "La Paletixa", "Tax") in created_accounts
+		assert ("IVA 16% Pagado - LP", "Current Assets - LP", "La Paletixa", "Tax") in created_accounts
+		assert ("Sales Taxes and Charges Template", "IVA 16% México", "IVA 16% Cobrado - LP") in created_templates
+		assert ("Purchase Taxes and Charges Template", "IVA 16% México Compras", "IVA 16% Pagado - LP") in created_templates
+		assert logger_messages == []
+	finally:
+		frappe.get_cached_doc = original_get_cached_doc
+		frappe.db.exists = original_exists
+		frappe.new_doc = original_new_doc
+		frappe.db.commit = original_commit
+		frappe.logger = original_logger
+
+
 def test_tenant_status_token_and_redaction():
 	subdomain = f"safety-token-{_unique_suffix()}"
 	original_user = frappe.session.user
@@ -208,6 +421,9 @@ def test_audit_safe_event_cancellation():
 
 def run():
 	print("Running backend safety regression checks...")
+	test_update_saas_config_uses_incoming_company_name_for_reservations()
+	test_update_saas_config_ignores_invalid_max_reservation_assets()
+	test_setup_mexican_taxes_falls_back_when_direct_liabilities_missing()
 	test_tenant_status_token_and_redaction()
 	test_tenant_active_gate_fails_closed()
 	test_audit_safe_wholesale_cancellation()
