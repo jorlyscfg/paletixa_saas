@@ -3760,6 +3760,38 @@ def create_or_update_user(email, first_name, last_name, roles, password=None, en
 	return {"success": True, "message": f"Usuario '{email}' guardado exitosamente."}
 
 
+def ensure_platform_admin_user(email, password):
+	if not email:
+		frappe.throw(frappe._("El correo electrónico es obligatorio"))
+
+	if not password:
+		frappe.throw(frappe._("La contraseña es obligatoria"))
+
+	if not frappe.db.exists("User", email):
+		user_doc = frappe.new_doc("User")
+		user_doc.email = email
+		user_doc.first_name = "Platform"
+		user_doc.last_name = "Admin"
+		user_doc.send_welcome_email = 0
+		user_doc.insert(ignore_permissions=True)
+	else:
+		user_doc = frappe.get_doc("User", email)
+
+	from frappe.utils.password import update_password
+
+	update_password(email, password)
+
+	if not any(r.role == "System Manager" for r in user_doc.roles):
+		user_doc.add_roles("System Manager")
+
+	if not user_doc.enabled:
+		user_doc.enabled = 1
+		user_doc.save(ignore_permissions=True)
+
+	frappe.db.commit()
+	return {"success": True, "message": f"User '{email}' ensured as platform admin."}
+
+
 @frappe.whitelist()
 def seed_test_stock():
 	if not frappe.session.user or frappe.session.user == "Guest":
