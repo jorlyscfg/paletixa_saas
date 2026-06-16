@@ -341,6 +341,30 @@ def test_tenant_active_gate_fails_closed():
 		frappe.local.form_dict = original_form_dict
 
 
+def test_tenant_admin_permission_allows_tenant_admin_and_blocks_master_site():
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_master_gate = saas_api._is_platform_master_site
+
+	try:
+		frappe.session.user = "admin@tenant.test"
+		frappe.get_roles = lambda user=None: []
+		saas_api._is_platform_master_site = lambda: False
+
+		saas_api.check_tenant_admin_permission()
+
+		saas_api._is_platform_master_site = lambda: True
+		try:
+			saas_api.check_tenant_admin_permission()
+			raise AssertionError("Expected PermissionError on master site")
+		except frappe.PermissionError:
+			pass
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		saas_api._is_platform_master_site = original_master_gate
+
+
 def _assert_audit_safe_cancellation(cancel_fn, sales_order_name, invoice_name, payment_name):
 	original_user = frappe.session.user
 	original_get_all = frappe.get_all

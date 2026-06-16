@@ -26,6 +26,31 @@ from paletixa_saas.config.platform_defaults import (
 )
 
 
+def is_tenant_admin_user(user=None):
+	user = user or frappe.session.user
+	if not user or user == "Guest":
+		return False
+
+	normalized_user = user.lower()
+	return user == "Administrator" or normalized_user.startswith("admin@") or normalized_user.startswith("admin.")
+
+
+def check_tenant_admin_permission():
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if _is_platform_master_site():
+		frappe.throw(
+			frappe._("Acceso denegado: Este endpoint solo está disponible en sitios de tenant."),
+			frappe.PermissionError,
+		)
+
+	if is_tenant_admin_user() or "System Manager" in frappe.get_roles(frappe.session.user):
+		return
+
+	frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+
+
 def setup_company_identity_fields():
 	# Evitar consultas redundantes usando la caché de Redis por sitio
 	cache_key = f"saas_fields_setup_done:v2:{frappe.local.site}"
@@ -385,13 +410,7 @@ def update_saas_config(
 	has_products=None,
 	has_purchasing=None,
 ):
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para realizar esta acción"), frappe.PermissionError)
-
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(
-			frappe._("No tenés permisos para cambiar la configuración del sistema"), frappe.PermissionError
-		)
+	check_tenant_admin_permission()
 
 	# Asegurar que existan los campos de marca
 	setup_company_identity_fields()
@@ -3480,11 +3499,7 @@ def seed_demo_data():
 
 @frappe.whitelist()
 def get_branches_and_cashiers():
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
-
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+	check_tenant_admin_permission()
 
 	# 1. Obtener todas las sucursales (POS Profiles)
 	profiles = frappe.get_all(
@@ -3510,11 +3525,7 @@ def get_branches_and_cashiers():
 
 @frappe.whitelist()
 def create_new_branch_with_cashiers(branch_name, cashier_emails=None):
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
-
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+	check_tenant_admin_permission()
 
 	if not branch_name:
 		frappe.throw(frappe._("El nombre de la sucursal es obligatorio"))
@@ -3606,11 +3617,7 @@ def create_new_branch_with_cashiers(branch_name, cashier_emails=None):
 
 @frappe.whitelist()
 def delete_branch(branch_name):
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
-
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+	check_tenant_admin_permission()
 
 	if not branch_name:
 		frappe.throw(frappe._("El nombre de la sucursal es obligatorio"))
@@ -3655,11 +3662,7 @@ def delete_branch(branch_name):
 
 @frappe.whitelist()
 def get_users_with_roles():
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
-
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+	check_tenant_admin_permission()
 
 	# 1. Obtener todos los usuarios del sistema excluyendo Administrador y Guest
 	users = frappe.get_all(
@@ -3702,11 +3705,7 @@ def get_users_with_roles():
 
 @frappe.whitelist()
 def create_or_update_user(email, first_name, last_name, roles, password=None, enabled=1, is_new=1):
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
-
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
+	check_tenant_admin_permission()
 
 	if not email:
 		frappe.throw(frappe._("El correo electrónico es obligatorio"))
