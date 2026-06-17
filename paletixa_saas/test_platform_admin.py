@@ -1,7 +1,9 @@
+import json
 import os
 import frappe
 import traceback
 from paletixa_saas.config.infrastructure import get_bench_path, resolve_platform_master_sites
+from paletixa_saas.paletixa_saas import api as saas_api
 from paletixa_saas.paletixa_saas.api import (
     get_platform_admin_dashboard,
     update_tenant_config,
@@ -111,6 +113,7 @@ def run():
             print(f"❌ FAILED: Could not retrieve platform admin dashboard: {str(e)}")
             traceback.print_exc()
             return
+
 
         if not tenants:
             print("\n⚠️ WARNING: No completed tenants found. Skipping cross-DB sync and branch limit tests.")
@@ -428,3 +431,160 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+
+def test_get_platform_admin_dashboard_falls_back_to_site_directory_when_requests_are_empty(monkeypatch, tmp_path):
+    sites_path = tmp_path / "sites"
+    sites_path.mkdir()
+
+    tenant_site = "erpnext.jegdev.com"
+    orphan_site = "orphan.jegdev.com"
+    master_site = "frontend"
+
+    for site_name, db_name in (
+        (tenant_site, "erpnext_jegdev_com"),
+        (orphan_site, "orphan_jegdev_com"),
+        (master_site, "master_frontend"),
+    ):
+        site_dir = sites_path / site_name
+        site_dir.mkdir()
+        (site_dir / "site_config.json").write_text(json.dumps({"db_name": db_name}))
+
+    class _FakeConfig:
+        def __init__(self, company_name=""):
+            self.company_name = company_name
+            self.is_active = 1
+            self.max_branches = 7
+            self.has_pos = 1
+            self.has_production = 0
+            self.has_logistics = 1
+            self.has_wholesale = 1
+            self.has_services = 0
+            self.has_products = 1
+            self.has_purchasing = 1
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    class _FakeSafeSiteContext:
+        def __init__(self, site):
+            self.site = site
+            self.previous_site = None
+
+        def __enter__(self):
+            self.previous_site = getattr(frappe.local, "site", None)
+            frappe.local.site = self.site
+            return frappe
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            frappe.local.site = self.previous_site
+
+    original_user = frappe.session.user
+    original_site = getattr(frappe.local, "site", None)
+    original_get_roles = frappe.get_roles
+    original_get_all = frappe.get_all
+    original_get_cached_doc = frappe.get_cached_doc
+    original_db_count = frappe.db.count
+    original_db_get_value = frappe.db.get_value
+    original_safe_context = saas_api.SafeSiteContext
+    original_is_master_site = saas_api._is_platform_master_site
+
+    def _fake_is_master_site(site=None):
+        site = site or getattr(frappe.local, "site", None)
+        return site == master_site
+
+    def _fake_get_all(doctype, filters=None, fields=None, order_by=None, limit=None):
+        site = getattr(frappe.local, "site", None)
+        if doctype == "SaaS Tenant Request":
+            return []
+        if doctype == "Company":
+            if site == tenant_site:
+                return [frappe._dict(name="Jeg Dev S.A. de C.V.")]
+            return []
+        if doctype == "POS Profile":
+            if site == tenant_site:
+                return [
+                    frappe._dict(name="North Branch", warehouse="WH-NORTH", disabled=0),
+                    frappe._dict(name="South Branch", warehouse="WH-SOUTH", disabled=1),
+                ]
+            if site == orphan_site:
+                return [frappe._dict(name="Orphan Branch", warehouse="WH-ORPHAN", disabled=0)]
+        return []
+
+    def _fake_db_count(doctype, filters=None):
+        site = getattr(frappe.local, "site", None)
+        if site == tenant_site and doctype == "User":
+            return 3
+        if site == tenant_site and doctype == "Customer":
+            return 4
+        if site == orphan_site and doctype == "User":
+            return 1
+        if site == orphan_site and doctype == "Customer":
+            return 2
+        return 0
+
+    def _fake_db_get_value(doctype, filters=None, fieldname=None, **kwargs):
+        site = getattr(frappe.local, "site", None)
+        if doctype == "Sales Invoice" and fieldname == "sum(grand_total)":
+            return 1250.5 if site == tenant_site else 245.0 if site == orphan_site else 0.0
+        if doctype == "Sales Invoice" and fieldname == "posting_date":
+            return "2026-06-10" if site == tenant_site else "2026-06-09" if site == orphan_site else None
+        return None
+
+    def _fake_get_cached_doc(doctype, name=None, *args, **kwargs):
+        site = getattr(frappe.local, "site", None)
+        if doctype == "SaaS Feature Config":
+            if site == tenant_site:
+                return _FakeConfig(company_name="Jeg Dev SaaS")
+            if site == orphan_site:
+                return _FakeConfig(company_name="")
+        raise AssertionError(f"Unexpected cached doc lookup: {doctype} {name} @ {site}")
+
+    try:
+        frappe.session.user = "Administrator"
+        frappe.local.site = master_site
+        frappe.get_roles = lambda user=None: ["System Manager"] if (user or frappe.session.user) != "Guest" else []
+        frappe.get_all = _fake_get_all
+        frappe.db.count = _fake_db_count
+        frappe.db.get_value = _fake_db_get_value
+        frappe.get_cached_doc = _fake_get_cached_doc
+        saas_api.SafeSiteContext = _FakeSafeSiteContext
+        saas_api._is_platform_master_site = _fake_is_master_site
+        saas_api.get_bench_path = lambda: str(tmp_path)
+        saas_api.get_sites_path = lambda: str(sites_path)
+
+        tenants = get_platform_admin_dashboard()
+
+        assert len(tenants) == 2
+        tenant_row = next(row for row in tenants if row["name"] == tenant_site)
+        orphan_row = next(row for row in tenants if row["name"] == orphan_site)
+
+        assert tenant_row["name"] == "erpnext"
+        assert tenant_row["site_name"] == tenant_site
+        assert tenant_row["company_name"] == "Jeg Dev S.A. de C.V."
+        assert tenant_row["database_name"] == "erpnext_jegdev_com"
+        assert tenant_row["branch_count"] == 2
+        assert tenant_row["users_count"] == 3
+        assert tenant_row["customers_count"] == 4
+        assert tenant_row["sales_30_days"] == 1250.5
+        assert tenant_row["active_modules"]["pos"] is True
+
+        assert orphan_row["name"] == "orphan"
+        assert orphan_row["site_name"] == orphan_site
+        assert orphan_row["company_name"] == "orphan"
+        assert orphan_row["database_name"] == "orphan_jegdev_com"
+        assert orphan_row["branch_count"] == 1
+        assert orphan_row["users_count"] == 1
+        assert orphan_row["customers_count"] == 2
+        assert orphan_row["sales_30_days"] == 245.0
+        assert orphan_row["active_modules"]["pos"] is True
+    finally:
+        frappe.session.user = original_user
+        frappe.local.site = original_site
+        frappe.get_roles = original_get_roles
+        frappe.get_all = original_get_all
+        frappe.db.count = original_db_count
+        frappe.db.get_value = original_db_get_value
+        frappe.get_cached_doc = original_get_cached_doc
+        saas_api.SafeSiteContext = original_safe_context
+        saas_api._is_platform_master_site = original_is_master_site

@@ -5385,6 +5385,156 @@ class SafeSiteContext:
 			pass
 
 
+def _populate_platform_dashboard_metrics(tenant, site_name):
+	tenant.setdefault("branches", [])
+	tenant.setdefault("branch_count", 0)
+	tenant.setdefault("users_count", 0)
+	tenant.setdefault("customers_count", 0)
+	tenant.setdefault("sales_30_days", 0.0)
+	tenant.setdefault("last_sale_date", None)
+	tenant.setdefault("active_modules", {})
+
+	try:
+		profiles = frappe.get_all("POS Profile", fields=["name", "warehouse", "disabled"])
+		tenant["branch_count"] = len([p for p in profiles if not p.disabled])
+		tenant["branches"] = [{"name": p.name, "warehouse": p.warehouse, "disabled": p.disabled} for p in profiles]
+
+		try:
+			tenant["users_count"] = frappe.db.count(
+				"User", {"enabled": 1, "name": ["not in", ["Administrator", "Guest"]]}
+			)
+		except Exception:
+			pass
+
+		try:
+			tenant["customers_count"] = frappe.db.count("Customer")
+		except Exception:
+			pass
+
+		try:
+			from frappe.utils import add_days, today
+
+			thirty_days_ago = add_days(today(), -30)
+			tenant["sales_30_days"] = (
+				frappe.db.get_value(
+					"Sales Invoice",
+					{"docstatus": 1, "posting_date": [">=", thirty_days_ago]},
+					"sum(grand_total)",
+				)
+				or 0.0
+			)
+		except Exception:
+			pass
+
+		try:
+			tenant["last_sale_date"] = frappe.db.get_value(
+				"Sales Invoice", {"docstatus": 1}, "posting_date", order_by="posting_date desc"
+			)
+		except Exception:
+			pass
+
+		try:
+			config = frappe.get_cached_doc("SaaS Feature Config")
+			tenant["active_modules"] = {
+				"pos": bool(config.has_pos),
+				"production": bool(config.has_production),
+				"logistics": bool(config.has_logistics),
+				"wholesale": bool(config.get("has_wholesale", 1)),
+				"services": bool(config.get("has_services") if config.get("has_services") is not None else 1),
+				"products": bool(config.get("has_products") if config.get("has_products") is not None else 1),
+				"purchasing": bool(config.get("has_purchasing", 0)),
+			}
+		except Exception:
+			pass
+	except Exception as ex:
+		tenant["error"] = str(ex)
+
+	return tenant
+
+
+def _derive_dashboard_tenant_name(site_name):
+	if not site_name:
+		return site_name
+	parts = str(site_name).split(".")
+	return parts[0].strip() or site_name
+
+
+def _build_platform_dashboard_row_from_site(site_name, database_name=""):
+	tenant_name = _derive_dashboard_tenant_name(site_name)
+	row = {
+		"name": tenant_name,
+		"site_name": site_name,
+		"company_name": tenant_name,
+		"admin_email": "",
+		"active": 1,
+		"max_branches": 0,
+		"creation": None,
+		"database_name": database_name or "",
+		"exempt_from_payment": 0,
+		"last_payment_date": None,
+		"expiration_date": None,
+	}
+
+	try:
+		with SafeSiteContext(site_name):
+			company_rows = []
+			try:
+				company_rows = frappe.get_all("Company", fields=["name"], limit=1)
+			except Exception:
+				pass
+
+			company_name = company_rows[0].name if company_rows else ""
+			config = None
+			try:
+				config = frappe.get_cached_doc("SaaS Feature Config")
+				is_active = config.get("is_active")
+				row["active"] = 1 if is_active is None else 1 if is_active else 0
+				row["max_branches"] = int(config.get("max_branches") or 0)
+			except Exception:
+				config = None
+
+			if company_name:
+				row["company_name"] = company_name
+			elif config:
+				row["company_name"] = config.get("company_name") or tenant_name
+
+			row = _populate_platform_dashboard_metrics(row, site_name)
+	except Exception as ex:
+			row["error"] = str(ex)
+
+	return row
+
+
+def _discover_platform_dashboard_tenants():
+	import os
+
+	sites_path = get_sites_path()
+	tenant_rows = []
+
+	for site_name in sorted(os.listdir(sites_path)):
+		site_path = os.path.join(sites_path, site_name)
+		if not os.path.isdir(site_path):
+			continue
+
+		if _is_platform_master_site(site_name):
+			continue
+
+		site_config_path = os.path.join(site_path, "site_config.json")
+		if not os.path.exists(site_config_path):
+			continue
+
+		database_name = ""
+		try:
+			with open(site_config_path) as f:
+				database_name = json.load(f).get("db_name", "")
+		except Exception:
+			pass
+
+		tenant_rows.append(_build_platform_dashboard_row_from_site(site_name, database_name=database_name))
+
+	return tenant_rows
+
+
 def check_platform_admin_permission():
 	if not _is_platform_master_site():
 		frappe.throw(
@@ -5416,90 +5566,39 @@ def get_platform_admin_dashboard():
 			"expiration_date",
 		],
 	)
+	if not tenants:
+		tenants = _discover_platform_dashboard_tenants()
 
 	bench_path = get_bench_path()
 	import os
 
 	for t in tenants:
-		t["branches"] = []
-		t["branch_count"] = 0
-		t["users_count"] = 0
-		t["customers_count"] = 0
-		t["sales_30_days"] = 0.0
-		t["last_sale_date"] = None
-		t["active_modules"] = {}
+		if "branches" not in t:
+			t["branches"] = []
+		if "branch_count" not in t:
+			t["branch_count"] = 0
+		if "users_count" not in t:
+			t["users_count"] = 0
+		if "customers_count" not in t:
+			t["customers_count"] = 0
+		if "sales_30_days" not in t:
+			t["sales_30_days"] = 0.0
+		if "last_sale_date" not in t:
+			t["last_sale_date"] = None
+		if "active_modules" not in t:
+			t["active_modules"] = {}
 
-		from paletixa_saas.paletixa_saas.api import get_base_domain
+		domain = t.get("site_name")
+		if not domain:
+			from paletixa_saas.paletixa_saas.api import get_base_domain
 
-		base_domain = get_base_domain()
-		domain = f"{t.name}.{base_domain}"
+			base_domain = get_base_domain()
+			domain = f"{t.name}.{base_domain}"
 
 		if os.path.exists(os.path.join(bench_path, "sites", domain)):
 			try:
 				with SafeSiteContext(domain):
-					# Recopilar sucursales (POS Profile)
-					profiles = frappe.get_all("POS Profile", fields=["name", "warehouse", "disabled"])
-					t["branch_count"] = len([p for p in profiles if not p.disabled])
-					t["branches"] = [
-						{"name": p.name, "warehouse": p.warehouse, "disabled": p.disabled} for p in profiles
-					]
-
-					# Recopilar usuarios activos (excluyendo Administrator y Guest)
-					try:
-						t["users_count"] = frappe.db.count(
-							"User", {"enabled": 1, "name": ["not in", ["Administrator", "Guest"]]}
-						)
-					except Exception:
-						pass
-
-					# Recopilar clientes registrados
-					try:
-						t["customers_count"] = frappe.db.count("Customer")
-					except Exception:
-						pass
-
-					# Recopilar ventas de los últimos 30 días
-					try:
-						from frappe.utils import add_days, today
-
-						thirty_days_ago = add_days(today(), -30)
-						t["sales_30_days"] = (
-							frappe.db.get_value(
-								"Sales Invoice",
-								{"docstatus": 1, "posting_date": [">=", thirty_days_ago]},
-								"sum(grand_total)",
-							)
-							or 0.0
-						)
-					except Exception:
-						pass
-
-					# Recopilar fecha de la última venta
-					try:
-						t["last_sale_date"] = frappe.db.get_value(
-							"Sales Invoice", {"docstatus": 1}, "posting_date", order_by="posting_date desc"
-						)
-					except Exception:
-						pass
-
-					# Recopilar características (módulos habilitados)
-					try:
-						config = frappe.get_cached_doc("SaaS Feature Config")
-						t["active_modules"] = {
-							"pos": bool(config.has_pos),
-							"production": bool(config.has_production),
-							"logistics": bool(config.has_logistics),
-							"wholesale": bool(config.get("has_wholesale", 1)),
-							"services": bool(
-								config.get("has_services") if config.get("has_services") is not None else 1
-							),
-							"products": bool(
-								config.get("has_products") if config.get("has_products") is not None else 1
-							),
-							"purchasing": bool(config.get("has_purchasing", 0)),
-						}
-					except Exception:
-						pass
+					_populate_platform_dashboard_metrics(t, domain)
 			except Exception as ex:
 				t["error"] = str(ex)
 
