@@ -45,6 +45,13 @@ def _get_primary_master_site():
 	return master_sites[0]
 
 
+def _resolve_workspace_id(subdomain=None, workspace_id=None):
+	identifier = workspace_id or subdomain
+	if not identifier:
+		return None
+	return identifier.lower().strip()
+
+
 def check_tenant_admin_permission():
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
@@ -5042,14 +5049,14 @@ def get_db_root_credentials():
 	return _get_db_root_credentials()
 
 
-def _validate_tenant_request_payload(subdomain, company_name, admin_email, admin_password):
+def _validate_tenant_request_payload(workspace_id, company_name, admin_email, admin_password):
 	reserved_subdomains = _get_reserved_subdomains()
 
-	if not subdomain or len(subdomain) > 30:
-		frappe.throw(frappe._("El subdominio debe tener entre 1 y 30 caracteres."))
+	if not workspace_id or len(workspace_id) > 30:
+		frappe.throw(frappe._("El Workspace ID debe tener entre 1 y 30 caracteres."))
 
-	if subdomain in reserved_subdomains:
-		frappe.throw(frappe._("El subdominio ingresado no está permitido."))
+	if workspace_id in reserved_subdomains:
+		frappe.throw(frappe._("El Workspace ID ingresado no está permitido."))
 
 	if not company_name or len(company_name.strip()) < 3:
 		frappe.throw(frappe._("El nombre de la empresa es obligatorio."))
@@ -5089,34 +5096,40 @@ def _enforce_tenant_request_rate_limit(max_requests=3, window_seconds=900):
 
 
 @frappe.whitelist(allow_guest=True)
-def request_tenant(subdomain, company_name, admin_email, admin_password):
+def request_tenant(subdomain=None, company_name=None, admin_email=None, admin_password=None, workspace_id=None):
 	master_site = _get_primary_master_site()
 	with SafeSiteContext(master_site):
-		return _request_tenant_impl(subdomain, company_name, admin_email, admin_password)
+		return _request_tenant_impl(
+			subdomain,
+			company_name,
+			admin_email,
+			admin_password,
+			workspace_id=workspace_id,
+		)
 
 
-def _request_tenant_impl(subdomain, company_name, admin_email, admin_password):
+def _request_tenant_impl(subdomain, company_name, admin_email, admin_password, workspace_id=None):
 	import os
 	import re
 	import secrets
 
 	_enforce_tenant_request_rate_limit()
-	if not subdomain or not re.match(r"^[a-zA-Z0-9\-]+$", subdomain):
+	workspace_id = _resolve_workspace_id(subdomain, workspace_id)
+	if not workspace_id or not re.match(r"^[a-zA-Z0-9\-]+$", workspace_id):
 		frappe.throw(
-			frappe._("El subdominio ingresado es inválido. Solo se admiten letras, números y guiones.")
+			frappe._("El Workspace ID ingresado es inválido. Solo se admiten letras, números y guiones.")
 		)
 
-	subdomain = subdomain.lower().strip()
-	_validate_tenant_request_payload(subdomain, company_name, admin_email, admin_password)
+	_validate_tenant_request_payload(workspace_id, company_name, admin_email, admin_password)
 	base_domain = get_base_domain()
-	domain = f"{subdomain}.{base_domain}"
+	domain = f"{workspace_id}.{base_domain}"
 	status_token = secrets.token_urlsafe(24)
 
 	# Check if request already exists or site exists
-	if frappe.db.exists("SaaS Tenant Request", {"subdomain": subdomain}):
-		existing_status = frappe.db.get_value("SaaS Tenant Request", {"subdomain": subdomain}, "status")
+	if frappe.db.exists("SaaS Tenant Request", {"subdomain": workspace_id}):
+		existing_status = frappe.db.get_value("SaaS Tenant Request", {"subdomain": workspace_id}, "status")
 		if existing_status != "Failed":
-			frappe.throw(frappe._("El subdominio ya está registrado o en proceso de creación."))
+			frappe.throw(frappe._("El Workspace ID ya está registrado o en proceso de creación."))
 
 	# Check if a folder already exists under sites/
 	sites_path = get_sites_path()
@@ -5124,8 +5137,8 @@ def _request_tenant_impl(subdomain, company_name, admin_email, admin_password):
 		frappe.throw(frappe._("El sitio ya existe en el servidor."))
 
 	# Create request
-	if frappe.db.exists("SaaS Tenant Request", {"subdomain": subdomain}):
-		doc = frappe.get_doc("SaaS Tenant Request", {"subdomain": subdomain})
+	if frappe.db.exists("SaaS Tenant Request", {"subdomain": workspace_id}):
+		doc = frappe.get_doc("SaaS Tenant Request", {"subdomain": workspace_id})
 		doc.company_name = company_name
 		doc.admin_email = admin_email
 		doc.admin_password = admin_password
@@ -5137,7 +5150,7 @@ def _request_tenant_impl(subdomain, company_name, admin_email, admin_password):
 		doc = frappe.get_doc(
 			{
 				"doctype": "SaaS Tenant Request",
-				"subdomain": subdomain,
+				"subdomain": workspace_id,
 				"company_name": company_name,
 				"admin_email": admin_email,
 				"admin_password": admin_password,
@@ -5167,21 +5180,24 @@ def _request_tenant_impl(subdomain, company_name, admin_email, admin_password):
 
 
 @frappe.whitelist(allow_guest=True)
-def get_tenant_status(subdomain, token=None):
+def get_tenant_status(subdomain=None, token=None, workspace_id=None):
 	master_site = _get_primary_master_site()
 	with SafeSiteContext(master_site):
-		return _get_tenant_status_impl(subdomain, token=token)
+		return _get_tenant_status_impl(subdomain, token=token, workspace_id=workspace_id)
 
 
-def _get_tenant_status_impl(subdomain, token=None):
+def _get_tenant_status_impl(subdomain, token=None, workspace_id=None):
 	import os
 
-	subdomain = subdomain.lower().strip()
-	if not frappe.db.exists("SaaS Tenant Request", {"subdomain": subdomain}):
+	workspace_id = _resolve_workspace_id(subdomain, workspace_id)
+	if not workspace_id:
+		return {"status": "NotFound"}
+
+	if not frappe.db.exists("SaaS Tenant Request", {"subdomain": workspace_id}):
 		return {"status": "NotFound"}
 
 	status, _error_log, status_token = frappe.db.get_value(
-		"SaaS Tenant Request", {"subdomain": subdomain}, ["status", "error_log", "status_token"]
+		"SaaS Tenant Request", {"subdomain": workspace_id}, ["status", "error_log", "status_token"]
 	)
 	if status_token and token != status_token:
 		return {"status": "NotFound"}
@@ -5195,7 +5211,7 @@ def _get_tenant_status_impl(subdomain, token=None):
 		response.update({"phase": "pending", "progress": 10, "message": frappe._("Validando solicitud...")})
 	elif status == "In Progress":
 		base_domain = get_base_domain()
-		site_name = f"{subdomain}.{base_domain}"
+		site_name = f"{workspace_id}.{base_domain}"
 		site_path = os.path.join(get_sites_path(), site_name)
 		if not os.path.exists(site_path):
 			response.update({
@@ -5207,7 +5223,7 @@ def _get_tenant_status_impl(subdomain, token=None):
 			try:
 				with SafeSiteContext(site_name):
 					company_exists = bool(frappe.db.count("Company") > 0)
-					admin_email = frappe.db.get_value("SaaS Tenant Request", {"subdomain": subdomain}, "admin_email")
+					admin_email = frappe.db.get_value("SaaS Tenant Request", {"subdomain": workspace_id}, "admin_email")
 					if not company_exists:
 						response.update({
 							"phase": "installing_apps",

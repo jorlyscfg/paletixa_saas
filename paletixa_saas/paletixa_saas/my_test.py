@@ -33,54 +33,64 @@ def run():
 		raise Exception("DocType 'SaaS Tenant Request' not found!")
 	print("✓ DocType exists in DB.")
 
-	# Test API request_tenant subdomain validations
+	# Test API request_tenant Workspace ID validations
 	from paletixa_saas.paletixa_saas.api import get_tenant_status, request_tenant
 
-	invalid_subs = [
+	invalid_workspace_ids = [
 		"my_company",
 		"test!",
 		"sub.domain",
 		"",
 		*sorted(get_reserved_subdomains()),
-		"this-subdomain-is-way-too-long-for-the-system-to-accept",
+		"this-workspace-id-is-way-too-long-for-the-system-to-accept",
 	]
-	for sub in invalid_subs:
+	for workspace_id in invalid_workspace_ids:
 		try:
-			request_tenant(sub, "Test Company", "admin@test.com", "admin123")
-			raise Exception(f"Failed to raise validation error for invalid subdomain: {sub}")
+			request_tenant(
+				workspace_id=workspace_id,
+				company_name="Test Company",
+				admin_email="admin@test.com",
+				admin_password="admin123",
+			)
+			raise Exception(f"Failed to raise validation error for invalid Workspace ID: {workspace_id}")
 		except frappe.ValidationError:
 			pass  # Expected behavior
-	print("✓ Subdomain format validation passes.")
+	print("✓ Workspace ID format validation passes.")
 
 	# Test request creation
-	subdomain = "test-tenant-temp"
+	workspace_id = "test-tenant-temp"
 	company_name = "Temp Company S.A."
 	admin_email = "admin@tempcompany.com"
 	admin_password = "SecretPassword123!"
 
 	# Delete any existing request safely
-	existing = frappe.db.get_value("SaaS Tenant Request", {"subdomain": subdomain}, "name")
+	existing = frappe.db.get_value("SaaS Tenant Request", {"subdomain": workspace_id}, "name")
 	if existing:
 		frappe.delete_doc("SaaS Tenant Request", existing, ignore_permissions=True)
 		frappe.db.commit()
 
-	res = request_tenant(subdomain, company_name, admin_email, admin_password)
-	if not res.get("success") or res.get("request_id") != subdomain or not res.get("request_token"):
+	res = request_tenant(
+		workspace_id=workspace_id,
+		company_name=company_name,
+		admin_email=admin_email,
+		admin_password=admin_password,
+	)
+	if not res.get("success") or res.get("request_id") != workspace_id or not res.get("request_token"):
 		raise Exception("Failed to register tenant request!")
 	request_token = res.get("request_token")
 
-	doc = frappe.get_doc("SaaS Tenant Request", subdomain)
+	doc = frappe.get_doc("SaaS Tenant Request", workspace_id)
 	if doc.company_name != company_name or doc.admin_email != admin_email or doc.status != "Pending":
 		raise Exception("Created request fields do not match request parameters!")
 	print("✓ Tenant Request document created successfully in DB.")
 
 	# Verify get_tenant_status endpoint
-	status_res = get_tenant_status(subdomain, token=request_token)
+	status_res = get_tenant_status(workspace_id=workspace_id, token=request_token)
 	if status_res.get("status") != "Pending":
 		raise Exception("Status polling did not return Pending!")
 	print("✓ Status polling returns Pending.")
 
-	unauth_status_res = get_tenant_status(subdomain)
+	unauth_status_res = get_tenant_status(workspace_id=workspace_id)
 	if unauth_status_res.get("status") != "NotFound":
 		raise Exception("Token-gated status polling did not reject missing token!")
 	print("✓ Status polling is token-gated.")
@@ -91,7 +101,7 @@ def run():
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 
-	failed_status_res = get_tenant_status(subdomain, token=request_token)
+	failed_status_res = get_tenant_status(workspace_id=workspace_id, token=request_token)
 	if failed_status_res.get("status") != "Failed":
 		raise Exception("Status polling did not return Failed!")
 	if "Traceback" in (failed_status_res.get("error_log") or ""):
@@ -99,7 +109,7 @@ def run():
 	print("✓ Failed status is sanitized for guest polling.")
 
 	# Clean up request
-	frappe.delete_doc("SaaS Tenant Request", subdomain, ignore_permissions=True)
+	frappe.delete_doc("SaaS Tenant Request", workspace_id, ignore_permissions=True)
 	frappe.db.commit()
 
 	print("All tests completed successfully! 🎉")

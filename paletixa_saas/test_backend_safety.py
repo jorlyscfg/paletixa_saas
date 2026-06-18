@@ -292,6 +292,44 @@ def test_tenant_status_token_and_redaction():
 		frappe.set_user(original_user)
 
 
+def test_tenant_status_accepts_workspace_id_alias():
+	workspace_id = f"safety-alias-{_unique_suffix()}"
+	original_user = frappe.session.user
+	original_enqueue = frappe.enqueue
+	original_rate_limit = saas_api._enforce_tenant_request_rate_limit
+	original_base_domain = saas_api.get_base_domain
+
+	try:
+		saas_api._enforce_tenant_request_rate_limit = lambda *args, **kwargs: None
+		saas_api.get_base_domain = lambda: "localhost"
+		frappe.enqueue = lambda *args, **kwargs: None
+
+		result = saas_api.request_tenant(
+			workspace_id=workspace_id,
+			company_name="Safety Test Company",
+			admin_email="admin@safety.test",
+			admin_password="SecretPassword123!",
+		)
+
+		assert result.get("success") is True
+		assert result.get("request_id") == workspace_id
+		token = result.get("request_token")
+		assert token
+
+		pending_status = saas_api.get_tenant_status(workspace_id=workspace_id, token=token)
+		assert pending_status.get("status") == "Pending"
+		assert pending_status.get("error_log") == ""
+
+		unauthorized_status = saas_api.get_tenant_status(workspace_id=workspace_id)
+		assert unauthorized_status.get("status") == "NotFound"
+	finally:
+		_cleanup_tenant_request(workspace_id)
+		frappe.enqueue = original_enqueue
+		saas_api._enforce_tenant_request_rate_limit = original_rate_limit
+		saas_api.get_base_domain = original_base_domain
+		frappe.set_user(original_user)
+
+
 def test_tenant_active_gate_fails_closed():
 	original_site = frappe.local.site
 	original_form_dict = getattr(frappe.local, "form_dict", None)
