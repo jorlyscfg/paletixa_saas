@@ -5137,7 +5137,7 @@ def request_tenant(subdomain, company_name, admin_email, admin_password):
 	frappe.enqueue(
 		"paletixa_saas.paletixa_saas.api.provision_tenant_task",
 		queue="long",
-		timeout=600,
+		timeout=1800,
 		request_id=doc.name,
 		base_domain=base_domain,
 	)
@@ -5165,7 +5165,35 @@ def get_tenant_status(subdomain, token=None):
 	safe_error_log = ""
 	if status == "Failed":
 		safe_error_log = frappe._("El aprovisionamiento falló. Contactá al administrador.")
-	return {"status": status, "error_log": safe_error_log}
+	response = {"status": status, "error_log": safe_error_log}
+
+	status_map = {
+		"Pending": {"phase": "pending", "progress": 10, "message": frappe._("Validando solicitud...")},
+		"Creating Site": {
+			"phase": "creating_site",
+			"progress": 25,
+			"message": frappe._("Creando la base de datos y preparando el sitio..."),
+		},
+		"Installing Apps": {
+			"phase": "installing_apps",
+			"progress": 55,
+			"message": frappe._("Instalando módulos y apps de ERPNext..."),
+		},
+		"Configuring Identity": {
+			"phase": "configuring_identity",
+			"progress": 80,
+			"message": frappe._("Configurando identidad, compañía y sucursales..."),
+		},
+		"In Progress": {
+			"phase": "creating_site",
+			"progress": 25,
+			"message": frappe._("Creando la base de datos y preparando el sitio..."),
+		},
+		"Completed": {"phase": "completed", "progress": 100, "message": frappe._("¡Despliegue exitoso!")},
+	}
+	response.update(status_map.get(status, {}))
+
+	return response
 
 
 def provision_tenant_task(request_id, base_domain="localhost"):
@@ -5178,7 +5206,7 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 	master_site = frappe.local.site
 
 	doc = frappe.get_doc("SaaS Tenant Request", request_id)
-	doc.status = "In Progress"
+	doc.status = "Creating Site"
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 
@@ -5219,6 +5247,11 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 				f"bench new-site failed with exit status {result.returncode}.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
 			)
 
+		doc = frappe.get_doc("SaaS Tenant Request", request_id)
+		doc.status = "Installing Apps"
+		doc.save(ignore_permissions=True)
+		frappe.db.commit()
+
 		# Extract db name from site_config.json
 		site_config_path = os.path.join(bench_path, "sites", domain, "site_config.json")
 		db_name = ""
@@ -5235,6 +5268,11 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 		frappe.connect()
 		frappe.set_user("Administrator")
 		try:
+			doc = frappe.get_doc("SaaS Tenant Request", request_id)
+			doc.status = "Configuring Identity"
+			doc.save(ignore_permissions=True)
+			frappe.db.commit()
+
 			# 1. Bypass setup wizard
 			frappe.db.set_default("desktop:home_page", "Workspace")
 			frappe.db.set_single_value(

@@ -40,7 +40,7 @@
    "fieldname": "status",
    "fieldtype": "Select",
    "label": "Estado",
-   "options": "Pending\nIn Progress\nCompleted\nFailed",
+    "options": "Pending\nCreating Site\nInstalling Apps\nConfiguring Identity\nIn Progress\nCompleted\nFailed",
    "default": "Pending",
    "read_only": 1
   },
