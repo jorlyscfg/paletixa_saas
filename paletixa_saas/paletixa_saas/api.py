@@ -16,6 +16,9 @@ from paletixa_saas.config.infrastructure import (
 	get_sites_path as _get_sites_path,
 )
 from paletixa_saas.config.infrastructure import (
+	resolve_platform_master_sites as _resolve_platform_master_sites,
+)
+from paletixa_saas.config.infrastructure import (
 	is_platform_master_site as _is_platform_master_site,
 )
 from paletixa_saas.config.platform_defaults import (
@@ -33,6 +36,13 @@ def is_tenant_admin_user(user=None):
 
 	normalized_user = user.lower()
 	return user == "Administrator" or normalized_user.startswith("admin@") or normalized_user.startswith("admin.")
+
+
+def _get_primary_master_site():
+	master_sites = sorted(_resolve_platform_master_sites())
+	if not master_sites:
+		frappe.throw(frappe._("No se pudo resolver el sitio maestro."), frappe.ValidationError)
+	return master_sites[0]
 
 
 def check_tenant_admin_permission():
@@ -5080,6 +5090,12 @@ def _enforce_tenant_request_rate_limit(max_requests=3, window_seconds=900):
 
 @frappe.whitelist(allow_guest=True)
 def request_tenant(subdomain, company_name, admin_email, admin_password):
+	master_site = _get_primary_master_site()
+	with SafeSiteContext(master_site):
+		return _request_tenant_impl(subdomain, company_name, admin_email, admin_password)
+
+
+def _request_tenant_impl(subdomain, company_name, admin_email, admin_password):
 	import os
 	import re
 	import secrets
@@ -5152,6 +5168,14 @@ def request_tenant(subdomain, company_name, admin_email, admin_password):
 
 @frappe.whitelist(allow_guest=True)
 def get_tenant_status(subdomain, token=None):
+	master_site = _get_primary_master_site()
+	with SafeSiteContext(master_site):
+		return _get_tenant_status_impl(subdomain, token=token)
+
+
+def _get_tenant_status_impl(subdomain, token=None):
+	import os
+
 	subdomain = subdomain.lower().strip()
 	if not frappe.db.exists("SaaS Tenant Request", {"subdomain": subdomain}):
 		return {"status": "NotFound"}
@@ -5167,31 +5191,49 @@ def get_tenant_status(subdomain, token=None):
 		safe_error_log = frappe._("El aprovisionamiento falló. Contactá al administrador.")
 	response = {"status": status, "error_log": safe_error_log}
 
-	status_map = {
-		"Pending": {"phase": "pending", "progress": 10, "message": frappe._("Validando solicitud...")},
-		"Creating Site": {
-			"phase": "creating_site",
-			"progress": 25,
-			"message": frappe._("Creando la base de datos y preparando el sitio..."),
-		},
-		"Installing Apps": {
-			"phase": "installing_apps",
-			"progress": 55,
-			"message": frappe._("Instalando módulos y apps de ERPNext..."),
-		},
-		"Configuring Identity": {
-			"phase": "configuring_identity",
-			"progress": 80,
-			"message": frappe._("Configurando identidad, compañía y sucursales..."),
-		},
-		"In Progress": {
-			"phase": "creating_site",
-			"progress": 25,
-			"message": frappe._("Creando la base de datos y preparando el sitio..."),
-		},
-		"Completed": {"phase": "completed", "progress": 100, "message": frappe._("¡Despliegue exitoso!")},
-	}
-	response.update(status_map.get(status, {}))
+	if status == "Pending":
+		response.update({"phase": "pending", "progress": 10, "message": frappe._("Validando solicitud...")})
+	elif status == "In Progress":
+		base_domain = get_base_domain()
+		site_name = f"{subdomain}.{base_domain}"
+		site_path = os.path.join(get_sites_path(), site_name)
+		if not os.path.exists(site_path):
+			response.update({
+				"phase": "creating_site",
+				"progress": 25,
+				"message": frappe._("Creando la base de datos y preparando el sitio..."),
+			})
+		else:
+			try:
+				with SafeSiteContext(site_name):
+					company_exists = bool(frappe.db.count("Company") > 0)
+					admin_email = frappe.db.get_value("SaaS Tenant Request", {"subdomain": subdomain}, "admin_email")
+					if not company_exists:
+						response.update({
+							"phase": "installing_apps",
+							"progress": 55,
+							"message": frappe._("Instalando módulos y apps de ERPNext..."),
+						})
+					elif admin_email and not frappe.db.exists("User", admin_email):
+						response.update({
+							"phase": "configuring_identity",
+							"progress": 80,
+							"message": frappe._("Configurando identidad, compañía y sucursales..."),
+						})
+					else:
+						response.update({
+							"phase": "configuring_identity",
+							"progress": 85,
+							"message": frappe._("Configurando identidad, compañía y sucursales..."),
+						})
+			except Exception:
+				response.update({
+					"phase": "installing_apps",
+					"progress": 55,
+					"message": frappe._("Instalando módulos y apps de ERPNext..."),
+				})
+	elif status == "Completed":
+		response.update({"phase": "completed", "progress": 100, "message": frappe._("¡Despliegue exitoso!")})
 
 	return response
 
@@ -5206,7 +5248,7 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 	master_site = frappe.local.site
 
 	doc = frappe.get_doc("SaaS Tenant Request", request_id)
-	doc.status = "Creating Site"
+	doc.status = "In Progress"
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 
@@ -5247,11 +5289,6 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 				f"bench new-site failed with exit status {result.returncode}.\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
 			)
 
-		doc = frappe.get_doc("SaaS Tenant Request", request_id)
-		doc.status = "Installing Apps"
-		doc.save(ignore_permissions=True)
-		frappe.db.commit()
-
 		# Extract db name from site_config.json
 		site_config_path = os.path.join(bench_path, "sites", domain, "site_config.json")
 		db_name = ""
@@ -5268,11 +5305,6 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 		frappe.connect()
 		frappe.set_user("Administrator")
 		try:
-			doc = frappe.get_doc("SaaS Tenant Request", request_id)
-			doc.status = "Configuring Identity"
-			doc.save(ignore_permissions=True)
-			frappe.db.commit()
-
 			# 1. Bypass setup wizard
 			frappe.db.set_default("desktop:home_page", "Workspace")
 			frappe.db.set_single_value(
