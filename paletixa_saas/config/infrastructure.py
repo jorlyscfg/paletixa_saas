@@ -85,16 +85,13 @@ def resolve_platform_master_sites():
 
 
 def is_platform_master_site(site=None):
-    site = site or getattr(frappe.local, "site", None)
-    if not site:
-        return False
+	site = site or getattr(frappe.local, "site", None)
+	if not site:
+		return False
 
-    try:
-        master_sites = resolve_platform_master_sites()
-    except frappe.ValidationError:
-        return False
+	master_sites = resolve_platform_master_sites()
 
-    return any(site == master_site or site.startswith(master_site) for master_site in master_sites)
+	return any(site == master_site or site.startswith(master_site) for master_site in master_sites)
 
 
 def get_reserved_subdomains():

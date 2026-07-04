@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import frappe
+import pytest
 
 from paletixa_saas.config import platform_defaults
 
@@ -13,8 +14,53 @@ class _FakeConfig:
 		return self._values.get(key, default)
 
 
+def test_platform_defaults_fail_closed_in_production_when_defaults_are_missing():
+	original_get_cached_doc = frappe.get_cached_doc
+	original_get_all = frappe.get_all
+	original_developer_mode = frappe.conf.get("developer_mode")
+	original_in_test = getattr(frappe.flags, "in_test", False)
+
+	try:
+		frappe.conf.developer_mode = 0
+		frappe.flags.in_test = False
+		frappe.get_cached_doc = lambda doctype, name=None: _FakeConfig({}) if doctype == "SaaS Feature Config" else None
+		frappe.get_all = lambda doctype, *args, **kwargs: [] if doctype == "Company" else []
+
+		with pytest.raises(frappe.ValidationError):
+			platform_defaults.get_platform_company_name()
+
+		with pytest.raises(frappe.ValidationError):
+			platform_defaults.get_platform_company_abbr()
+
+		with pytest.raises(frappe.ValidationError):
+			platform_defaults.get_platform_distribution_warehouse()
+
+		with pytest.raises(frappe.ValidationError):
+			platform_defaults.get_platform_payment_account("Cash")
+	finally:
+		frappe.get_cached_doc = original_get_cached_doc
+		frappe.get_all = original_get_all
+		frappe.conf.developer_mode = original_developer_mode
+		frappe.flags.in_test = original_in_test
+
+
+def test_platform_defaults_fall_back_to_single_company_when_config_identity_is_missing():
+	original_get_cached_doc = frappe.get_cached_doc
+	original_get_all = frappe.get_all
+
+	try:
+		frappe.get_cached_doc = lambda doctype, name=None: _FakeConfig({}) if doctype == "SaaS Feature Config" else SimpleNamespace(abbr="TC")
+		frappe.get_all = lambda doctype, *args, **kwargs: ([{"name": "Tenant Co"}] if doctype == "Company" else [])
+
+		assert platform_defaults.get_platform_company_name() == "Tenant Co"
+		assert platform_defaults.get_platform_company_abbr() == "TC"
+	finally:
+		frappe.get_cached_doc = original_get_cached_doc
+		frappe.get_all = original_get_all
+
+
 def run_tests():
-	print("🚀 Verificando resolución explícita de defaults de plataforma...")
+	print("🚀 Verificando resolución explícita de defaults de plataforma sin fallback demo...")
 
 	original_get_cached_doc = frappe.get_cached_doc
 	try:

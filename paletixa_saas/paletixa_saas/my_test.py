@@ -49,6 +49,10 @@ def run():
 			request_tenant(
 				workspace_id=workspace_id,
 				company_name="Test Company",
+				company_tax_id="RFC-TEST",
+				company_address="Calle Principal 123",
+				company_phone="5551234567",
+				company_email="ops@test.com",
 				admin_email="admin@test.com",
 				admin_password="admin123",
 			)
@@ -72,6 +76,10 @@ def run():
 	res = request_tenant(
 		workspace_id=workspace_id,
 		company_name=company_name,
+		company_tax_id="RFC-TEMP",
+		company_address="Calle Principal 123",
+		company_phone="5551234567",
+		company_email="ops@tempcompany.com",
 		admin_email=admin_email,
 		admin_password=admin_password,
 	)

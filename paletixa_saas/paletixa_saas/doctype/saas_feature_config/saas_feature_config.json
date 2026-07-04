@@ -68,13 +68,125 @@
    "label": "Color Primario",
    "default": "#1abc9c"
   },
-  {
-   "fieldname": "client_logo",
-   "fieldtype": "Attach Image",
-   "label": "Logo del Cliente"
-  },
-  {
-   "fieldname": "is_active",
+   {
+    "fieldname": "client_logo",
+    "fieldtype": "Attach Image",
+    "label": "Logo del Cliente"
+   },
+   {
+    "fieldname": "runtime_identity_section",
+    "fieldtype": "Section Break",
+    "label": "Identidad y Runtime"
+   },
+   {
+    "fieldname": "company_name",
+    "fieldtype": "Data",
+    "label": "Nombre de la Empresa",
+    "default": ""
+   },
+   {
+    "fieldname": "company_tax_id",
+    "fieldtype": "Data",
+    "label": "Tax ID de la Empresa",
+    "default": ""
+   },
+   {
+    "fieldname": "company_address",
+    "fieldtype": "Small Text",
+    "label": "Dirección de la Empresa",
+    "default": ""
+   },
+   {
+    "fieldname": "company_phone",
+    "fieldtype": "Data",
+    "label": "Teléfono de la Empresa",
+    "default": ""
+   },
+   {
+    "fieldname": "company_email",
+    "fieldtype": "Data",
+    "label": "Email de la Empresa",
+    "default": ""
+   },
+   {
+    "fieldname": "company_abbr",
+    "fieldtype": "Data",
+    "label": "Abreviatura de la Empresa",
+    "default": ""
+   },
+   {
+    "fieldname": "default_distribution_warehouse",
+    "fieldtype": "Link",
+    "label": "Almacén de Distribución por Defecto",
+    "options": "Warehouse",
+    "default": ""
+   },
+   {
+    "fieldname": "default_cash_account",
+    "fieldtype": "Link",
+    "label": "Cuenta de Efectivo por Defecto",
+    "options": "Account",
+    "default": ""
+   },
+   {
+    "fieldname": "default_bank_account",
+    "fieldtype": "Link",
+    "label": "Cuenta Bancaria por Defecto",
+    "options": "Account",
+    "default": ""
+   },
+   {
+    "fieldname": "custom_country",
+    "fieldtype": "Link",
+    "label": "País",
+    "options": "Country",
+    "default": "Mexico"
+   },
+   {
+    "fieldname": "custom_currency",
+    "fieldtype": "Link",
+    "label": "Moneda",
+    "options": "Currency",
+    "default": "MXN"
+   },
+   {
+    "fieldname": "ticket_header",
+    "fieldtype": "Small Text",
+    "label": "Encabezado del Ticket",
+    "default": ""
+   },
+   {
+    "fieldname": "ticket_footer",
+    "fieldtype": "Small Text",
+    "label": "Pie del Ticket",
+    "default": ""
+   },
+   {
+    "fieldname": "print_logo",
+    "fieldtype": "Check",
+    "label": "Imprimir Logo",
+    "default": 1
+   },
+   {
+    "fieldname": "print_tax_id",
+    "fieldtype": "Check",
+    "label": "Imprimir Tax ID",
+    "default": 1
+   },
+   {
+    "fieldname": "print_address",
+    "fieldtype": "Check",
+    "label": "Imprimir Dirección",
+    "default": 1
+   },
+   {
+    "fieldname": "print_contact",
+    "fieldtype": "Check",
+    "label": "Imprimir Contacto",
+    "default": 1
+   },
+   {
+    "fieldname": "is_active",
    "fieldtype": "Check",
    "label": "Activo",
    "default": 1

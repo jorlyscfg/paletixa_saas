@@ -56,13 +56,13 @@ def run_tests():
 
 	# Preparar abastecimiento de stock
 	test_item_code = test_item["name"]
-	wh = get_platform_distribution_warehouse(allow_demo_fallback=True)
+	wh = get_platform_distribution_warehouse()
 
 	print("   Abasteciendo inventario en bodega para asegurar stock físico...")
 	se = frappe.new_doc("Stock Entry")
 	se.purpose = "Material Receipt"
 	se.stock_entry_type = "Material Receipt"
-	se.company = get_platform_company_name(allow_demo_fallback=True)
+	se.company = get_platform_company_name()
 	se.append("items", {"item_code": test_item_code, "qty": 500.0, "t_warehouse": wh, "basic_rate": 10.0})
 	se.insert(ignore_permissions=True)
 	se.submit()
@@ -391,11 +391,11 @@ def run_tests():
 		event_wh_names = [w["name"] for w in event_whs]
 		print(f"✅ Éxito: Almacenes de Carritos resueltos: {event_wh_names}")
 
-		company_abbr = get_platform_company_abbr(allow_demo_fallback=True)
+		company_abbr = get_platform_company_abbr()
 		target_carrito_wh = "Carrito 1"
 		# Asegurar que Carrito 1 exista y esté habilitado
 		if not frappe.db.exists("Warehouse", f"Carrito 1 - {company_abbr}"):
-			target_carrito_wh = get_platform_distribution_warehouse(allow_demo_fallback=True)
+			target_carrito_wh = get_platform_distribution_warehouse()
 		else:
 			target_carrito_wh = f"Carrito 1 - {company_abbr}"
 
@@ -406,7 +406,7 @@ def run_tests():
 		se_wh = frappe.new_doc("Stock Entry")
 		se_wh.purpose = "Material Receipt"
 		se_wh.stock_entry_type = "Material Receipt"
-		se_wh.company = get_platform_company_name(allow_demo_fallback=True)
+		se_wh.company = get_platform_company_name()
 		se_wh.append(
 			"items",
 			{"item_code": test_item_code, "qty": 300.0, "t_warehouse": target_carrito_wh, "basic_rate": 10.0},
@@ -595,7 +595,7 @@ def run_tests():
 		# 7b. Crear una notificación de prueba directamente (simulando inserción de Sales Order)
 		print("   Insertando Sales Order de prueba para disparar el hook...")
 		so_test = frappe.new_doc("Sales Order")
-		so_test.company = get_platform_company_name(allow_demo_fallback=True)
+		so_test.company = get_platform_company_name()
 		so_test.customer = test_customer_name
 		so_test.delivery_date = frappe.utils.add_days(frappe.utils.today(), 1)
 		so_test.selling_price_list = "Standard Selling"
@@ -608,7 +608,7 @@ def run_tests():
 				"item_code": test_item_code,
 				"qty": 10.0,
 				"rate": 15.0,
-				"warehouse": get_platform_distribution_warehouse(allow_demo_fallback=True),
+				"warehouse": get_platform_distribution_warehouse(),
 				"delivery_date": so_test.delivery_date,
 			},
 		)

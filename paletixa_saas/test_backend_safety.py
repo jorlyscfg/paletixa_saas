@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 
+import json
+import subprocess
 import uuid
+from types import SimpleNamespace
 
 import frappe
+import pytest
 
+from paletixa_saas.config import infrastructure
 from paletixa_saas.paletixa_saas import api as saas_api
 
 
@@ -75,6 +80,49 @@ class _FakeSaaSConfig:
 		return dict(self.__dict__)
 
 
+class _FakeRuntimeConfig:
+	def __init__(self):
+		self.company_name = ""
+		self.company_abbr = ""
+		self.company_tax_id = ""
+		self.company_address = ""
+		self.company_phone = ""
+		self.company_email = ""
+		self.default_distribution_warehouse = ""
+		self.default_cash_account = ""
+		self.default_bank_account = ""
+		self.custom_country = ""
+		self.custom_currency = ""
+		self.is_active = 0
+		self.max_branches = 0
+		self.print_logo = 0
+		self.print_tax_id = 0
+		self.print_address = 0
+		self.print_contact = 0
+		self.ticket_header = ""
+		self.ticket_footer = ""
+		self.saved_snapshots = []
+
+	def get(self, key, default=None):
+		return getattr(self, key, default)
+
+	def save(self, ignore_permissions=False):
+		self.saved_snapshots.append(
+			{
+				"company_name": self.company_name,
+				"company_abbr": self.company_abbr,
+				"default_distribution_warehouse": self.default_distribution_warehouse,
+				"default_cash_account": self.default_cash_account,
+				"default_bank_account": self.default_bank_account,
+				"custom_country": self.custom_country,
+				"custom_currency": self.custom_currency,
+				"is_active": self.is_active,
+				"max_branches": self.max_branches,
+			}
+		)
+		return self
+
+
 class _RecordingDoc:
 	def __init__(self, doctype):
 		self.doctype = doctype
@@ -87,6 +135,446 @@ class _RecordingDoc:
 		return self
 
 
+def test_create_custom_field_requires_system_manager(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cashier@example.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(
+		frappe.db,
+		"exists",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected schema lookup")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para configurar el sistema"):
+		saas_api.create_custom_field()
+
+
+def test_generate_customer_access_pin_requires_system_manager(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cashier@example.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(
+		frappe.db,
+		"set_value",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected PIN write")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para generar un PIN de acceso"):
+		saas_api.generate_customer_access_pin("CUST-001")
+
+
+def test_create_pos_opening_requires_assigned_operator_or_system_manager(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cashier@example.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(frappe.db, "exists", lambda *args, **kwargs: False)
+	monkeypatch.setattr(
+		frappe,
+		"new_doc",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected POS opening creation")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match=r"No tenés permisos para realizar esta acción\."):
+		saas_api.create_pos_opening(
+			"Punto de Venta - Sucursal 4",
+			"La Paletixa",
+			[{"mode_of_payment": "Cash", "opening_amount": 100.0}],
+		)
+
+
+def test_close_pos_shift_requires_own_shift_or_system_manager(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cashier@example.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(
+		frappe.db,
+		"sql",
+		lambda *args, **kwargs: [
+			SimpleNamespace(
+				status="Open",
+				pos_closing_entry=None,
+				user="other@example.test",
+				pos_profile="Punto de Venta - Sucursal 4",
+			)
+		],
+	)
+	monkeypatch.setattr(
+		frappe,
+		"get_doc",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected POS opening load")),
+	)
+	monkeypatch.setattr(
+		frappe,
+		"new_doc",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected POS closing creation")),
+	)
+	monkeypatch.setattr(
+		frappe.db,
+		"commit",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected commit")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match=r"No tenés permisos para realizar esta acción\."):
+		saas_api.close_pos_shift(
+			"POS-OPE-2026-00003",
+			[{"mode_of_payment": "Cash", "closing_amount": 100.0}],
+		)
+
+
+def test_notification_reads_require_system_manager(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cashier@example.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(saas_api, "ensure_saas_notification_doctype", lambda: None)
+	monkeypatch.setattr(
+		frappe.db,
+		"count",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected notification count")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para acceder a esta información"):
+		saas_api.get_unread_notifications()
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para realizar esta acción"):
+		saas_api.mark_notification_as_read("SAA-001")
+
+
+def test_seed_demo_data_requires_tenant_admin_or_system_manager(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cashier@example.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(
+		frappe.db,
+		"exists",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected mutation lookup")),
+	)
+	monkeypatch.setattr(
+		frappe.db,
+		"set_single_value",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected settings mutation")),
+	)
+	monkeypatch.setattr(
+		frappe.db,
+		"sql",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected sql mutation")),
+	)
+	monkeypatch.setattr(
+		frappe,
+		"delete_doc",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected destructive mutation")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para realizar esta acción"):
+		saas_api.seed_demo_data()
+
+
+def test_provision_tenant_task_uses_safe_site_context_and_persists_status(monkeypatch, tmp_path):
+	import erpnext.setup.setup_wizard.operations.install_fixtures as install_fixtures_module
+	from frappe.core.doctype.user import user as user_module
+	from frappe.utils import password as password_module
+
+	request_id = f"provision-{_unique_suffix()}"
+	master_site = "frontend"
+	subdomain = f"tenant-{_unique_suffix()}"
+	domain = f"{subdomain}.localhost"
+	sites_path = tmp_path / "sites"
+	site_dir = sites_path / domain
+	site_dir.mkdir(parents=True)
+	(site_dir / "site_config.json").write_text(json.dumps({"db_name": "tenant_db"}))
+
+	saved_states = []
+	entered_sites = []
+	runtime_config = _FakeRuntimeConfig()
+	company_doc = SimpleNamespace(
+		abbr="TC",
+		country="Mexico",
+		default_currency="MXN",
+		get=lambda key, default=None: {"country": "Mexico", "default_currency": "MXN"}.get(key, default),
+	)
+
+	class _FakeTenantRequest:
+		def __init__(self):
+			self.name = request_id
+			self.subdomain = subdomain
+			self.company_name = "Tenant Co"
+			self.company_tax_id = "RFC-TENANT"
+			self.company_address = "Calle Provisión 123"
+			self.company_phone = "5550001234"
+			self.company_email = "ops@tenant.test"
+			self.admin_email = "admin@example.test"
+			self.max_branches = 6
+			self.status = "Pending"
+			self.database_name = ""
+			self.error_log = ""
+
+		def get_password(self, fieldname):
+			assert fieldname == "admin_password"
+			return "SecretPassword123!"
+
+		def save(self, ignore_permissions=False):
+			saved_states.append((self.status, self.database_name, self.error_log))
+			return self
+
+	def _fake_get_all(doctype, filters=None, fields=None, order_by=None, limit=None, **kwargs):
+		filters = filters or {}
+		company_filter = filters.get("company")
+		if doctype == "Warehouse" and company_filter == request_doc.company_name:
+			if filters.get("is_group", 0) == 0 and filters.get("disabled", 0) == 0:
+				if filters.get("name") in {None, "Distribution - TC"}:
+					return [{"name": "Distribution - TC"}]
+		if doctype == "Account" and company_filter == request_doc.company_name:
+			if filters.get("is_group", 0) == 0 and filters.get("disabled", 0) == 0:
+				if filters.get("account_type") == "Cash" and filters.get("name") in {None, "Cash - TC"}:
+					return [{"name": "Cash - TC"}]
+				if filters.get("account_type") == "Bank" and filters.get("name") in {None, "Bank - TC"}:
+					return [{"name": "Bank - TC"}]
+				if filters.get("account_type") is None and filters.get("name") == "Cash - TC":
+					return [{"name": "Cash - TC"}]
+				if filters.get("account_type") is None and filters.get("name") == "Bank - TC":
+					return [{"name": "Bank - TC"}]
+		return []
+
+	class _FakeWritableDoc:
+		def __init__(self, doctype):
+			self.doctype = doctype
+			self.roles = []
+
+		def insert(self, ignore_permissions=False):
+			return self
+
+		def add_roles(self, *roles):
+			self.roles.extend(roles)
+
+	class _FakeSafeSiteContext:
+		def __init__(self, site):
+			self.site = site
+			self.previous_site = None
+
+		def __enter__(self):
+			self.previous_site = getattr(frappe.local, "site", None)
+			entered_sites.append(self.site)
+			frappe.local.site = self.site
+			return frappe
+
+		def __exit__(self, exc_type, exc_val, exc_tb):
+			frappe.local.site = self.previous_site
+
+	def _unexpected_raw_context_switch(*args, **kwargs):
+		raise AssertionError("unexpected raw context switch")
+
+	def _fake_get_doc(doctype, name=None, *args, **kwargs):
+		if doctype == "SaaS Tenant Request" and name == request_id:
+			return request_doc
+		if doctype == "SaaS Feature Config" and name is None:
+			return runtime_config
+		raise AssertionError(f"Unexpected get_doc lookup: {doctype} {name}")
+
+	def _fake_get_cached_doc(doctype, name=None, *args, **kwargs):
+		if doctype == "Company" and name == request_doc.company_name:
+			return company_doc
+		if doctype == "SaaS Feature Config":
+			return runtime_config
+		raise AssertionError(f"Unexpected cached doc lookup: {doctype} {name}")
+
+	def _fake_new_doc(doctype):
+		return _FakeWritableDoc(doctype)
+
+	request_doc = _FakeTenantRequest()
+	original_site = getattr(frappe.local, "site", None)
+	role_permission_calls = []
+
+	monkeypatch.setattr(saas_api, "SafeSiteContext", _FakeSafeSiteContext)
+	monkeypatch.setattr(saas_api, "get_bench_path", lambda: str(tmp_path))
+	monkeypatch.setattr(saas_api, "get_sites_path", lambda: str(sites_path))
+	monkeypatch.setattr(saas_api, "get_db_root_credentials", lambda: ("root", "rootpass"))
+	monkeypatch.setattr(frappe, "get_doc", _fake_get_doc)
+	monkeypatch.setattr(frappe, "get_cached_doc", _fake_get_cached_doc)
+	monkeypatch.setattr(frappe, "get_all", _fake_get_all)
+	monkeypatch.setattr(frappe, "new_doc", _fake_new_doc)
+	monkeypatch.setattr(frappe.db, "exists", lambda doctype, name=None, *args, **kwargs: False)
+	monkeypatch.setattr(frappe.db, "set_default", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe.db, "set_single_value", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "set_user", lambda user: setattr(frappe.session, "user", user))
+	monkeypatch.setattr(frappe, "destroy", _unexpected_raw_context_switch)
+	monkeypatch.setattr(frappe, "init", _unexpected_raw_context_switch)
+	monkeypatch.setattr(frappe, "connect", _unexpected_raw_context_switch)
+	monkeypatch.setattr(password_module, "update_password", lambda *args, **kwargs: None)
+	monkeypatch.setattr(user_module, "generate_keys", lambda *args, **kwargs: None)
+	monkeypatch.setattr(install_fixtures_module, "install", lambda *args, **kwargs: None)
+	monkeypatch.setattr(saas_api, "setup_saas_role_permissions", lambda: role_permission_calls.append("called"))
+	monkeypatch.setattr(
+		subprocess,
+		"run",
+		lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+	)
+
+	try:
+		frappe.local.site = master_site
+		saas_api.provision_tenant_task(request_id, base_domain="localhost")
+	finally:
+		frappe.local.site = original_site
+
+	assert entered_sites == [domain]
+	assert saved_states == [("In Progress", "", ""), ("Completed", "tenant_db", "")]
+	assert request_doc.status == "Completed"
+	assert request_doc.database_name == "tenant_db"
+	assert request_doc.error_log == ""
+	assert runtime_config.saved_snapshots
+	assert runtime_config.company_name == "Tenant Co"
+	assert runtime_config.company_abbr == "TC"
+	assert runtime_config.default_distribution_warehouse == "Distribution - TC"
+	assert runtime_config.default_cash_account == "Cash - TC"
+	assert runtime_config.default_bank_account == "Bank - TC"
+	assert role_permission_calls == ["called"]
+	assert runtime_config.custom_country == "Mexico"
+	assert runtime_config.custom_currency == "MXN"
+	assert runtime_config.is_active == 1
+	assert runtime_config.max_branches == 6
+	assert frappe.local.site == original_site
+
+
+def test_provision_tenant_task_blocks_completion_when_runtime_links_are_missing(monkeypatch, tmp_path):
+	import erpnext.setup.setup_wizard.operations.install_fixtures as install_fixtures_module
+	from frappe.core.doctype.user import user as user_module
+	from frappe.utils import password as password_module
+
+	request_id = f"provision-missing-{_unique_suffix()}"
+	master_site = "frontend"
+	subdomain = f"tenant-missing-{_unique_suffix()}"
+	domain = f"{subdomain}.localhost"
+	sites_path = tmp_path / "sites"
+	site_dir = sites_path / domain
+	site_dir.mkdir(parents=True)
+	(site_dir / "site_config.json").write_text(json.dumps({"db_name": "tenant_db_missing"}))
+
+	saved_states = []
+	runtime_config = _FakeRuntimeConfig()
+	company_doc = SimpleNamespace(
+		abbr="TC",
+		country="Mexico",
+		default_currency="MXN",
+		get=lambda key, default=None: {"country": "Mexico", "default_currency": "MXN"}.get(key, default),
+	)
+
+	class _FakeTenantRequest:
+		def __init__(self):
+			self.name = request_id
+			self.subdomain = subdomain
+			self.company_name = "Tenant Missing Co"
+			self.company_tax_id = "RFC-MISSING"
+			self.company_address = "Calle Falta 123"
+			self.company_phone = "5550005678"
+			self.company_email = "ops@missing.test"
+			self.admin_email = "admin@missing.test"
+			self.max_branches = 3
+			self.status = "Pending"
+			self.database_name = ""
+			self.error_log = ""
+
+		def get_password(self, fieldname):
+			assert fieldname == "admin_password"
+			return "SecretPassword123!"
+
+		def save(self, ignore_permissions=False):
+			saved_states.append((self.status, self.database_name, self.error_log))
+			return self
+
+	def _fake_get_all(doctype, filters=None, fields=None, order_by=None, limit=None, **kwargs):
+		filters = filters or {}
+		company_filter = filters.get("company")
+		if doctype == "Warehouse" and company_filter == request_doc.company_name:
+			if filters.get("is_group", 0) == 0 and filters.get("disabled", 0) == 0:
+				return [{"name": "Distribution - TC"}]
+		if doctype == "Account" and company_filter == request_doc.company_name:
+			if filters.get("is_group", 0) == 0 and filters.get("disabled", 0) == 0:
+				if filters.get("account_type") == "Cash" and filters.get("name") in {None, "Cash - TC"}:
+					return [{"name": "Cash - TC"}]
+				if filters.get("account_type") == "Bank" and filters.get("name") in {None, "Bank - TC"}:
+					return []
+				if filters.get("account_type") is None and filters.get("name") == "Cash - TC":
+					return [{"name": "Cash - TC"}]
+				if filters.get("account_type") is None and filters.get("name") == "Bank - TC":
+					return []
+		return []
+
+	class _FakeWritableDoc:
+		def __init__(self, doctype):
+			self.doctype = doctype
+			self.roles = []
+
+		def insert(self, ignore_permissions=False):
+			return self
+
+		def add_roles(self, *roles):
+			self.roles.extend(roles)
+
+	class _FakeSafeSiteContext:
+		def __init__(self, site):
+			self.site = site
+			self.previous_site = None
+
+		def __enter__(self):
+			self.previous_site = getattr(frappe.local, "site", None)
+			frappe.local.site = self.site
+			return frappe
+
+		def __exit__(self, exc_type, exc_val, exc_tb):
+			frappe.local.site = self.previous_site
+
+	def _fake_get_doc(doctype, name=None, *args, **kwargs):
+		if doctype == "SaaS Tenant Request" and name == request_id:
+			return request_doc
+		if doctype == "SaaS Feature Config" and name is None:
+			return runtime_config
+		raise AssertionError(f"Unexpected get_doc lookup: {doctype} {name}")
+
+	def _fake_get_cached_doc(doctype, name=None, *args, **kwargs):
+		if doctype == "Company" and name == request_doc.company_name:
+			return company_doc
+		if doctype == "SaaS Feature Config":
+			return runtime_config
+		raise AssertionError(f"Unexpected cached doc lookup: {doctype} {name}")
+
+	def _fake_new_doc(doctype):
+		return _FakeWritableDoc(doctype)
+
+	request_doc = _FakeTenantRequest()
+	original_site = getattr(frappe.local, "site", None)
+
+	monkeypatch.setattr(saas_api, "SafeSiteContext", _FakeSafeSiteContext)
+	monkeypatch.setattr(saas_api, "get_bench_path", lambda: str(tmp_path))
+	monkeypatch.setattr(saas_api, "get_sites_path", lambda: str(sites_path))
+	monkeypatch.setattr(saas_api, "get_db_root_credentials", lambda: ("root", "rootpass"))
+	monkeypatch.setattr(frappe, "get_doc", _fake_get_doc)
+	monkeypatch.setattr(frappe, "get_cached_doc", _fake_get_cached_doc)
+	monkeypatch.setattr(frappe, "get_all", _fake_get_all)
+	monkeypatch.setattr(frappe, "new_doc", _fake_new_doc)
+	monkeypatch.setattr(frappe.db, "exists", lambda doctype, name=None, *args, **kwargs: False)
+	monkeypatch.setattr(frappe.db, "set_default", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe.db, "set_single_value", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "set_user", lambda user: setattr(frappe.session, "user", user))
+	monkeypatch.setattr(frappe, "destroy", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "init", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "connect", lambda *args, **kwargs: None)
+	monkeypatch.setattr(password_module, "update_password", lambda *args, **kwargs: None)
+	monkeypatch.setattr(user_module, "generate_keys", lambda *args, **kwargs: None)
+	monkeypatch.setattr(install_fixtures_module, "install", lambda *args, **kwargs: None)
+	monkeypatch.setattr(saas_api, "setup_saas_role_permissions", lambda: None)
+	monkeypatch.setattr(
+		subprocess,
+		"run",
+		lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+	)
+
+	try:
+		frappe.local.site = master_site
+		saas_api.provision_tenant_task(request_id, base_domain="localhost")
+	finally:
+		frappe.local.site = original_site
+
+	assert saved_states[-1][0] == "Failed"
+	assert request_doc.status == "Failed"
+	assert request_doc.database_name == ""
+	assert request_doc.error_log
+	assert "runtime" in request_doc.error_log.lower() or "enlaces" in request_doc.error_log.lower()
+
+
 def test_update_saas_config_uses_incoming_company_name_for_reservations():
 	original_user = frappe.session.user
 	original_get_roles = frappe.get_roles
@@ -96,6 +584,7 @@ def test_update_saas_config_uses_incoming_company_name_for_reservations():
 	original_clear_cache = frappe.clear_cache
 	original_setup_fields = saas_api.setup_company_identity_fields
 	original_sync_warehouses = saas_api.sync_event_warehouses
+	original_master_gate = saas_api._is_platform_master_site
 
 	fake_config = _FakeSaaSConfig()
 	sync_calls = []
@@ -109,6 +598,7 @@ def test_update_saas_config_uses_incoming_company_name_for_reservations():
 		frappe.clear_cache = lambda *args, **kwargs: None
 		saas_api.setup_company_identity_fields = lambda: None
 		saas_api.sync_event_warehouses = lambda company_name, max_assets: sync_calls.append((company_name, max_assets))
+		saas_api._is_platform_master_site = lambda: False
 
 		result = saas_api.update_saas_config(
 			company_name="Nueva Plataforma",
@@ -127,6 +617,7 @@ def test_update_saas_config_uses_incoming_company_name_for_reservations():
 		frappe.clear_cache = original_clear_cache
 		saas_api.setup_company_identity_fields = original_setup_fields
 		saas_api.sync_event_warehouses = original_sync_warehouses
+		saas_api._is_platform_master_site = original_master_gate
 
 
 def test_update_saas_config_ignores_invalid_max_reservation_assets():
@@ -138,6 +629,7 @@ def test_update_saas_config_ignores_invalid_max_reservation_assets():
 	original_clear_cache = frappe.clear_cache
 	original_setup_fields = saas_api.setup_company_identity_fields
 	original_sync_warehouses = saas_api.sync_event_warehouses
+	original_master_gate = saas_api._is_platform_master_site
 
 	fake_config = _FakeSaaSConfig()
 	fake_config.max_reservation_assets = 5
@@ -152,6 +644,7 @@ def test_update_saas_config_ignores_invalid_max_reservation_assets():
 		frappe.clear_cache = lambda *args, **kwargs: None
 		saas_api.setup_company_identity_fields = lambda: None
 		saas_api.sync_event_warehouses = lambda company_name, max_assets: sync_calls.append((company_name, max_assets))
+		saas_api._is_platform_master_site = lambda: False
 
 		result = saas_api.update_saas_config(
 			company_name="Nueva Plataforma",
@@ -170,6 +663,904 @@ def test_update_saas_config_ignores_invalid_max_reservation_assets():
 		frappe.clear_cache = original_clear_cache
 		saas_api.setup_company_identity_fields = original_setup_fields
 		saas_api.sync_event_warehouses = original_sync_warehouses
+		saas_api._is_platform_master_site = original_master_gate
+
+
+def test_update_saas_config_skips_reservation_validation_when_disabled():
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_get_doc = frappe.get_doc
+	original_exists = frappe.db.exists
+	original_commit = frappe.db.commit
+	original_clear_cache = frappe.clear_cache
+	original_setup_fields = saas_api.setup_company_identity_fields
+	original_sync_warehouses = saas_api.sync_event_warehouses
+	original_master_gate = saas_api._is_platform_master_site
+
+	class _DisabledReservationsConfig(_FakeSaaSConfig):
+		def __init__(self):
+			super().__init__()
+			self.has_reservations = 0
+			self.reservation_item_code = "Carrito Paletero"
+			self.max_reservation_assets = 9
+			self.default_event_items = '[{"item_code": "Carrito Paletero"}]'
+			self.saved = False
+
+		def save(self, ignore_permissions=False):
+			assert self.reservation_item_code == ""
+			assert self.max_reservation_assets == 0
+			assert self.default_event_items == "[]"
+			self.saved = True
+			return self
+
+	fake_config = _DisabledReservationsConfig()
+	sync_calls = []
+
+	try:
+		frappe.session.user = "Administrator"
+		frappe.get_roles = lambda user=None: ["System Manager"]
+		frappe.get_doc = lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else None
+		frappe.db.exists = lambda doctype, name=None, *args, **kwargs: False
+		frappe.db.commit = lambda *args, **kwargs: None
+		frappe.clear_cache = lambda *args, **kwargs: None
+		saas_api.setup_company_identity_fields = lambda: None
+		saas_api.sync_event_warehouses = lambda company_name, max_assets: sync_calls.append((company_name, max_assets))
+		saas_api._is_platform_master_site = lambda: False
+
+		result = saas_api.update_saas_config(
+			company_name="Nueva Plataforma",
+			has_reservations=0,
+			reservation_item_code="Carrito Paletero",
+			max_reservation_assets=7,
+			default_event_items='[{"item_code": "Carrito Paletero"}]',
+		)
+
+		assert result["success"] is True
+		assert fake_config.saved is True
+		assert sync_calls == []
+		assert fake_config.has_reservations == 0
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		frappe.get_doc = original_get_doc
+		frappe.db.exists = original_exists
+		frappe.db.commit = original_commit
+		frappe.clear_cache = original_clear_cache
+		saas_api.setup_company_identity_fields = original_setup_fields
+		saas_api.sync_event_warehouses = original_sync_warehouses
+		saas_api._is_platform_master_site = original_master_gate
+
+
+def test_update_saas_config_skips_mexico_taxes_activation_when_disabled():
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_get_doc = frappe.get_doc
+	original_exists = frappe.db.exists
+	original_commit = frappe.db.commit
+	original_clear_cache = frappe.clear_cache
+	original_setup_mexico_taxes = saas_api.setup_mexican_taxes_and_fields
+	original_master_gate = saas_api._is_platform_master_site
+
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_mexico_taxes = 0
+	activation_calls = []
+
+	try:
+		frappe.session.user = "Administrator"
+		frappe.get_roles = lambda user=None: ["System Manager"]
+		frappe.get_doc = lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else None
+		frappe.db.exists = lambda doctype, name=None, *args, **kwargs: False
+		frappe.db.commit = lambda *args, **kwargs: None
+		frappe.clear_cache = lambda *args, **kwargs: None
+		saas_api.setup_mexican_taxes_and_fields = lambda company_name: activation_calls.append(company_name)
+		saas_api._is_platform_master_site = lambda: False
+
+		result = saas_api.update_saas_config(
+			company_name="Nueva Plataforma",
+			has_mexico_taxes=0,
+		)
+
+		assert result["success"] is True
+		assert activation_calls == []
+		assert fake_config.has_mexico_taxes == 0
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		frappe.get_doc = original_get_doc
+		frappe.db.exists = original_exists
+		frappe.db.commit = original_commit
+		frappe.clear_cache = original_clear_cache
+		saas_api.setup_mexican_taxes_and_fields = original_setup_mexico_taxes
+		saas_api._is_platform_master_site = original_master_gate
+
+
+def test_activate_mexican_taxes_handles_setup_outside_generic_save():
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_get_doc = frappe.get_doc
+	original_commit = frappe.db.commit
+	original_clear_cache = frappe.clear_cache
+	original_setup_mexico_taxes = saas_api.setup_mexican_taxes_and_fields
+	original_master_gate = saas_api._is_platform_master_site
+
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_mexico_taxes = 0
+	activation_calls = []
+
+	try:
+		frappe.session.user = "Administrator"
+		frappe.get_roles = lambda user=None: ["System Manager"]
+		frappe.get_doc = lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else None
+		frappe.db.commit = lambda *args, **kwargs: None
+		frappe.clear_cache = lambda *args, **kwargs: None
+		saas_api.setup_mexican_taxes_and_fields = lambda company_name: activation_calls.append(company_name)
+		saas_api._is_platform_master_site = lambda: False
+
+		result = saas_api.activate_mexican_taxes(company_name="Nueva Plataforma")
+
+		assert result["success"] is True
+		assert activation_calls == ["Nueva Plataforma"]
+		assert fake_config.has_mexico_taxes == 1
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		frappe.get_doc = original_get_doc
+		frappe.db.commit = original_commit
+		frappe.clear_cache = original_clear_cache
+		saas_api.setup_mexican_taxes_and_fields = original_setup_mexico_taxes
+		saas_api._is_platform_master_site = original_master_gate
+
+
+def test_update_saas_config_saves_when_wholesale_is_disabled(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	wholesale_setup_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe, "get_doc", lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe.db, "exists", lambda doctype, name=None, *args, **kwargs: False)
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "clear_cache", lambda *args, **kwargs: None)
+	monkeypatch.setattr(saas_api, "setup_company_identity_fields", lambda: None)
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: wholesale_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "sync_event_warehouses", lambda *args, **kwargs: None)
+	monkeypatch.setattr(saas_api, "_is_platform_master_site", lambda: False)
+
+	result = saas_api.update_saas_config(company_name="Nueva Plataforma", has_wholesale=0)
+
+	assert result["success"] is True
+	assert fake_config.has_wholesale == 0
+	assert wholesale_setup_calls == []
+
+
+def test_get_admin_dashboard_metrics_does_not_bootstrap_optional_fields(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	wholesale_setup_calls = []
+	reservation_setup_calls = []
+	custom_field_creations = []
+
+	def _sql_stub(query, *args, **kwargs):
+		if kwargs.get("as_dict"):
+			return []
+		if "COUNT(" in query and "SUM(" in query:
+			return [(0, 0.0)]
+		if "SUM(grand_total)" in query:
+			return [(0.0,)]
+		return []
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe.db, "sql", _sql_stub)
+	monkeypatch.setattr(
+		frappe,
+		"get_doc",
+		lambda doctype, *args, **kwargs: custom_field_creations.append((doctype, args, kwargs)) or SimpleNamespace(),
+	)
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: wholesale_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "setup_reservation_fields", lambda: reservation_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "get_platform_company_name", lambda: "Nueva Plataforma")
+	monkeypatch.setattr(saas_api, "get_platform_company_abbr", lambda company=None: "NP")
+
+	result = saas_api.get_admin_dashboard_metrics()
+
+	assert result["success"] is True
+	assert wholesale_setup_calls == []
+	assert reservation_setup_calls == []
+	assert custom_field_creations == []
+
+
+def test_get_sales_report_data_does_not_bootstrap_reservation_setup_when_disabled(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_reservations = 0
+	wholesale_setup_calls = []
+	reservation_setup_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe.db, "sql", lambda *args, **kwargs: [])
+	monkeypatch.setattr(
+		frappe,
+		"get_cached_doc",
+		lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None,
+	)
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: wholesale_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "setup_reservation_fields", lambda: reservation_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "get_platform_company_name", lambda: "Nueva Plataforma")
+	monkeypatch.setattr(saas_api, "get_platform_company_abbr", lambda company=None: "NP")
+
+	result = saas_api.get_sales_report_data()
+
+	assert result["success"] is True
+	assert result["sales_trend"] == []
+	assert wholesale_setup_calls == []
+	assert reservation_setup_calls == []
+
+
+def test_get_stock_report_data_does_not_bootstrap_reservation_setup_when_disabled(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_reservations = 0
+	wholesale_setup_calls = []
+	reservation_setup_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe.db, "sql", lambda *args, **kwargs: [])
+	monkeypatch.setattr(
+		frappe,
+		"get_cached_doc",
+		lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None,
+	)
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: wholesale_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "setup_reservation_fields", lambda: reservation_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "get_platform_company_name", lambda: "Nueva Plataforma")
+	monkeypatch.setattr(saas_api, "get_platform_company_abbr", lambda company=None: "NP")
+
+	result = saas_api.get_stock_report_data()
+
+	assert result["success"] is True
+	assert result["stock_data"] == []
+	assert wholesale_setup_calls == []
+	assert reservation_setup_calls == []
+
+
+def test_get_all_customers_omits_wholesale_pin_when_field_is_missing(monkeypatch):
+	requested_fields = []
+
+	class _CustomerMeta:
+		def has_field(self, fieldname):
+			return False
+
+	def _fake_get_all(doctype, *args, **kwargs):
+		requested_fields.extend(kwargs.get("fields") or [])
+		return [{"name": "CUST-0001", "customer_name": "Cliente Prueba"}]
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe, "get_meta", lambda doctype: _CustomerMeta() if doctype == "Customer" else None)
+	monkeypatch.setattr(frappe, "get_all", _fake_get_all)
+
+	customers = saas_api.get_all_customers()
+
+	assert "custom_wholesale_access_pin" not in requested_fields
+	assert customers == [{"name": "CUST-0001", "customer_name": "Cliente Prueba", "custom_wholesale_access_pin": None}]
+
+
+def test_get_customer_orders_history_blocks_cajero_users_with_mismatched_profiles(monkeypatch):
+	fetch_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "cajero.s1.t1@lapaletixa.com", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(
+		saas_api,
+		"get_customer_wholesale_profile",
+		lambda: {"success": True, "customer": "CUST-0001"},
+	)
+	monkeypatch.setattr(frappe, "get_all", lambda *args, **kwargs: fetch_calls.append((args, kwargs)) or [])
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para ver este historial\\."):
+		saas_api.get_customer_orders_history("CUST-9999")
+
+	assert fetch_calls == []
+
+
+def test_get_customer_orders_history_allows_matching_customer_profile(monkeypatch):
+	fetch_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "cliente@example.com", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+	monkeypatch.setattr(
+		saas_api,
+		"get_customer_wholesale_profile",
+		lambda: {"success": True, "customer": "CUST-0001"},
+	)
+
+	def _fake_get_all(doctype, *args, **kwargs):
+		fetch_calls.append((doctype, kwargs))
+		if doctype == "Sales Order":
+			return [{"name": "SO-0001"}]
+		if doctype == "Sales Invoice":
+			return [{"name": "SI-0001"}]
+		return []
+
+	monkeypatch.setattr(frappe, "get_all", _fake_get_all)
+
+	result = saas_api.get_customer_orders_history("CUST-0001")
+
+	assert result == {"orders": [{"name": "SO-0001"}], "invoices": [{"name": "SI-0001"}]}
+	assert [doctype for doctype, _ in fetch_calls] == ["Sales Order", "Sales Invoice"]
+
+
+def test_get_all_customers_rejects_non_tenant_admin_users(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "cliente@example.com", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: [])
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para acceder a esta información\\."):
+		saas_api.get_all_customers()
+
+
+def test_create_service_invoice_rejects_non_service_operators_before_invoice_creation(monkeypatch):
+	begin_calls = []
+	exists_calls = []
+	new_doc_calls = []
+	get_roles_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "support.admin@example.com", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: get_roles_calls.append(user or frappe.session.user) or [])
+	monkeypatch.setattr(frappe.db, "begin", lambda *args, **kwargs: begin_calls.append((args, kwargs)))
+	monkeypatch.setattr(frappe.db, "exists", lambda *args, **kwargs: exists_calls.append((args, kwargs)) or True)
+	monkeypatch.setattr(frappe, "new_doc", lambda *args, **kwargs: new_doc_calls.append((args, kwargs)) or SimpleNamespace())
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para registrar servicios"):
+		saas_api.create_service_invoice(
+			customer="CUST-0001",
+			items=[{"item_code": "ITEM-0001", "qty": 1, "rate": 10}],
+			payment_amount=10,
+			payment_mode="Cash",
+		)
+
+	assert get_roles_calls == []
+	assert begin_calls == []
+	assert exists_calls == []
+	assert new_doc_calls == []
+
+
+def test_create_notification_on_order_does_not_bootstrap_wholesale_setup_for_core_flow(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_wholesale = 0
+	fake_config.reservation_item_code = "Carrito Paletero"
+	wholesale_setup_calls = []
+	notification_doctype_calls = []
+	new_doc_calls = []
+
+	def _fake_new_doc(doctype, *args, **kwargs):
+		new_doc_calls.append(doctype)
+		return SimpleNamespace(insert=lambda *a, **k: None)
+
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "new_doc", _fake_new_doc)
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "log_error", lambda *args, **kwargs: None)
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: wholesale_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "ensure_saas_notification_doctype", lambda: notification_doctype_calls.append("called"))
+
+	doc = SimpleNamespace(
+		get=lambda key, default=None: None,
+		items=[SimpleNamespace(item_code="ITEM-0001")],
+		customer_name="Cliente Prueba",
+		name="SO-0001",
+	)
+
+	saas_api.create_notification_on_order(doc)
+
+	assert wholesale_setup_calls == []
+	assert notification_doctype_calls == []
+	assert new_doc_calls == []
+
+
+def test_wholesale_endpoints_short_circuit_when_disabled(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_wholesale = 0
+	wholesale_setup_calls = []
+	item_get_all_calls = []
+	warehouse_sql_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe.db, "begin", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe.db, "rollback", lambda *args, **kwargs: None)
+	monkeypatch.setattr(
+		frappe,
+		"get_all",
+		lambda doctype, *args, **kwargs: item_get_all_calls.append((doctype, args, kwargs)) or [],
+	)
+	monkeypatch.setattr(
+		frappe.db,
+		"sql",
+		lambda query, *args, **kwargs: warehouse_sql_calls.append((query, args, kwargs)) or [],
+	)
+	monkeypatch.setattr(frappe, "throw", lambda *args, **kwargs: (_ for _ in ()).throw(frappe.PermissionError(*args)))
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: wholesale_setup_calls.append("called"))
+
+	profile = saas_api.get_customer_wholesale_profile()
+	assert profile == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	access = saas_api.validate_wholesale_access(phone="55 4433 2211", pin="123456")
+	assert access == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	orders = saas_api.get_pending_wholesale_orders()
+	assert orders == []
+
+	create_res = saas_api.create_wholesale_order(items=[{"item_code": "ITEM-0001", "qty": 1}])
+	assert create_res == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	complete_res = saas_api.complete_wholesale_order("SO-0001")
+	assert complete_res == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	cancel_res = saas_api.cancel_wholesale_order("SO-0001")
+	assert cancel_res == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	items_res = saas_api.get_active_items_with_prices(warehouse="WH-0001")
+	assert items_res == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	warehouses_res = saas_api.get_active_warehouses_with_stock()
+	assert warehouses_res == {"success": False, "error": "El módulo de mayoristas está deshabilitado."}
+
+	assert wholesale_setup_calls == []
+	assert item_get_all_calls == []
+	assert warehouse_sql_calls == []
+
+
+def test_get_active_items_with_prices_hides_stock_for_non_admins(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_wholesale = 1
+	item_group_calls = []
+	item_price_calls = []
+	bin_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "employee@tenant.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["Employee"])
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+
+	def _fake_get_all(doctype, *args, **kwargs):
+		if doctype == "Item Group":
+			item_group_calls.append((args, kwargs))
+			return [{"name": "Products"}]
+		if doctype == "Item":
+			return [{"name": "ITEM-0001", "item_name": "Item 1", "item_group": "Products", "standard_rate": 10, "image": None}]
+		if doctype == "Item Price":
+			item_price_calls.append((args, kwargs))
+			return [{"item_code": "ITEM-0001", "price_list": "Standard Selling", "price_list_rate": 12}]
+		if doctype == "Bin":
+			bin_calls.append((args, kwargs))
+			return []
+		return []
+
+	monkeypatch.setattr(frappe, "get_all", _fake_get_all)
+
+	items = saas_api.get_active_items_with_prices(warehouse="WH-0001")
+
+	assert bin_calls == []
+	assert items[0]["actual_qty"] is None
+	assert items[0]["retail_price"] == 12
+	assert item_group_calls
+	assert item_price_calls
+
+
+def test_get_active_warehouses_with_stock_requires_admin_access(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_wholesale = 1
+
+	monkeypatch.setattr(frappe.session, "user", "employee@tenant.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["Employee"])
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "throw", lambda *args, **kwargs: (_ for _ in ()).throw(frappe.PermissionError(*args)))
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para acceder a este recurso"):
+		saas_api.get_active_warehouses_with_stock()
+
+
+def test_get_item_barcodes_requires_auth_and_operator_access(monkeypatch):
+	monkeypatch.setattr(frappe.session, "user", "employee@tenant.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["Employee"])
+	monkeypatch.setattr(
+		frappe,
+		"get_all",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected barcode read")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para acceder a este recurso"):
+		saas_api.get_item_barcodes()
+
+
+def test_create_wholesale_order_rejects_spoofed_guest_customer_without_token_before_document_creation(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_wholesale = 1
+	new_doc_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "Guest", raising=False)
+	monkeypatch.setattr(
+		frappe,
+		"get_cached_doc",
+		lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None,
+	)
+	monkeypatch.setattr(saas_api, "setup_wholesale_custom_fields", lambda: None)
+	monkeypatch.setattr(frappe.db, "exists", lambda *args, **kwargs: True)
+	monkeypatch.setattr(
+		frappe,
+		"new_doc",
+		lambda *args, **kwargs: new_doc_calls.append((args, kwargs)) or (_ for _ in ()).throw(
+			AssertionError("Sales Order should not be created")
+		),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="Sesión mayorista inválida"):
+		saas_api.create_wholesale_order(
+			items=[{"item_code": "ITEM-0001", "qty": 1}],
+			metodo_pago="Transferencia",
+			metodo_entrega="Domicilio",
+			customer="CUST-SPOOFED",
+		)
+
+	assert new_doc_calls == []
+
+
+def test_create_wholesale_sale_blocks_non_privileged_authenticated_users_before_document_creation(monkeypatch):
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_wholesale = 1
+	create_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "employee@tenant.test", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["Employee"])
+	monkeypatch.setattr(saas_api, "_is_platform_master_site", lambda: False)
+	monkeypatch.setattr(
+		frappe,
+		"get_cached_doc",
+		lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None,
+	)
+	monkeypatch.setattr(
+		saas_api,
+		"get_platform_company_name",
+		lambda: (_ for _ in ()).throw(AssertionError("Company lookup should not happen")),
+	)
+	monkeypatch.setattr(
+		saas_api,
+		"get_platform_distribution_warehouse",
+		lambda: (_ for _ in ()).throw(AssertionError("Warehouse lookup should not happen")),
+	)
+	monkeypatch.setattr(
+		frappe,
+		"new_doc",
+		lambda *args, **kwargs: create_calls.append((args, kwargs)) or (_ for _ in ()).throw(
+			AssertionError("Sales Invoice should not be created")
+		),
+	)
+	monkeypatch.setattr(
+		frappe.db,
+		"commit",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("No writes should happen")),
+	)
+
+	with pytest.raises(frappe.PermissionError, match="No tenés permisos para acceder a este recurso\\."):
+		saas_api.create_wholesale_sale(
+			customer="CUST-0001",
+			items=[{"item_code": "ITEM-0001", "qty": 1, "rate": 10}],
+			payment_amount=10,
+			payment_mode="Cash",
+			warehouse="WH-0001",
+		)
+
+	assert create_calls == []
+
+
+def test_get_features_omits_reservation_defaults_when_disabled(monkeypatch):
+	class _DisabledFeatureConfig:
+		primary_color = "#1abc9c"
+		has_pos = 0
+		has_production = 0
+		has_logistics = 0
+		has_reservations = 0
+		has_wholesale = 0
+		has_mexico_taxes = 0
+		has_services = 0
+		has_products = 0
+		has_purchasing = 0
+		reservation_item_code = "Carrito Paletero"
+		max_reservation_assets = 12
+		default_event_items = '[{"item_code": "Carrito Paletero"}]'
+		custom_country = "Mexico"
+		custom_currency = "MXN"
+		company_name = ""
+		company_logo = ""
+		company_tax_id = ""
+		company_address = ""
+		company_phone = ""
+		company_email = ""
+		ticket_header = ""
+		ticket_footer = ""
+		print_logo = 0
+		print_tax_id = 0
+		print_address = 0
+		print_contact = 0
+		is_active = 0
+		max_branches = 0
+
+		def get(self, key, default=None):
+			return getattr(self, key, default)
+
+	monkeypatch.setattr(saas_api, "setup_company_identity_fields", lambda: None)
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: _DisabledFeatureConfig())
+
+	response = saas_api.get_features()
+
+	assert response["features"]["reservations"] is False
+	assert response["reservation_item_code"] == ""
+	assert response["max_reservation_assets"] == 0
+	assert response["default_event_items"] == "[]"
+
+
+def test_get_features_does_not_bootstrap_inventory_permissions_when_products_disabled(monkeypatch):
+	created_docs = []
+
+	class _CoreFeatureMeta:
+		def has_field(self, fieldname):
+			return fieldname in {
+				"company_name",
+				"company_tax_id",
+				"company_address",
+				"company_phone",
+				"company_email",
+				"company_abbr",
+				"default_distribution_warehouse",
+				"default_cash_account",
+				"default_bank_account",
+				"ticket_header",
+				"ticket_footer",
+				"print_logo",
+				"print_tax_id",
+				"print_address",
+				"print_contact",
+			}
+
+	class _FakeCache:
+		def get_value(self, key):
+			return None
+
+		def set_value(self, key, value):
+			return None
+
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_products = 0
+	fake_config.company_name = "Nueva Plataforma"
+	fake_config.company_abbr = "NP"
+
+	monkeypatch.setattr(saas_api, "setup_service_role_permissions", lambda: None)
+	monkeypatch.setattr(frappe, "get_meta", lambda doctype: _CoreFeatureMeta() if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "get_doc", lambda payload: created_docs.append(payload) or SimpleNamespace(insert=lambda ignore_permissions=False: None))
+	monkeypatch.setattr(frappe, "cache", lambda: _FakeCache())
+
+	response = saas_api.get_features()
+
+	assert response["features"]["products"] is False
+	assert created_docs == []
+
+
+def test_get_features_does_not_bootstrap_service_permissions_when_services_disabled(monkeypatch):
+	class _CoreFeatureMeta:
+		def has_field(self, fieldname):
+			return fieldname in {
+				"company_name",
+				"company_tax_id",
+				"company_address",
+				"company_phone",
+				"company_email",
+				"company_abbr",
+				"default_distribution_warehouse",
+				"default_cash_account",
+				"default_bank_account",
+				"ticket_header",
+				"ticket_footer",
+				"print_logo",
+				"print_tax_id",
+				"print_address",
+				"print_contact",
+			}
+
+	class _FakeCache:
+		def get_value(self, key):
+			return None
+
+		def set_value(self, key, value):
+			return None
+
+	fake_config = _FakeSaaSConfig()
+	fake_config.has_services = 0
+	fake_config.company_name = "Nueva Plataforma"
+	fake_config.company_abbr = "NP"
+	service_setup_calls = []
+
+	monkeypatch.setattr(frappe.local, "site", "test.localhost", raising=False)
+	monkeypatch.setattr(saas_api, "setup_service_role_permissions", lambda: service_setup_calls.append("called"))
+	monkeypatch.setattr(frappe, "get_meta", lambda doctype: _CoreFeatureMeta() if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "cache", lambda: _FakeCache())
+
+	response = saas_api.get_features()
+
+	assert response["features"]["services"] is False
+	assert service_setup_calls == []
+
+
+def test_update_saas_config_saves_without_inventory_bootstrap_when_products_disabled(monkeypatch):
+	created_docs = []
+
+	class _CoreFeatureMeta:
+		def has_field(self, fieldname):
+			return fieldname in {
+				"company_name",
+				"company_tax_id",
+				"company_address",
+				"company_phone",
+				"company_email",
+				"company_abbr",
+				"default_distribution_warehouse",
+				"default_cash_account",
+				"default_bank_account",
+				"ticket_header",
+				"ticket_footer",
+				"print_logo",
+				"print_tax_id",
+				"print_address",
+				"print_contact",
+			}
+
+	class _FakeCache:
+		def get_value(self, key):
+			return None
+
+		def set_value(self, key, value):
+			return None
+
+	class _ProductsDisabledConfig(_FakeSaaSConfig):
+		def __init__(self):
+			super().__init__()
+			self.has_products = 0
+			self.saved = False
+
+		def save(self, ignore_permissions=False):
+			self.saved = True
+			return self
+
+	fake_config = _ProductsDisabledConfig()
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe, "get_meta", lambda doctype: _CoreFeatureMeta() if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe, "get_doc", lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else created_docs.append((doctype, args, kwargs)) or SimpleNamespace(insert=lambda ignore_permissions=False: None))
+	monkeypatch.setattr(frappe.db, "exists", lambda *args, **kwargs: False)
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "clear_cache", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "cache", lambda: _FakeCache())
+	monkeypatch.setattr(saas_api, "setup_service_role_permissions", lambda: None)
+	monkeypatch.setattr(saas_api, "_is_platform_master_site", lambda: False)
+
+	result = saas_api.update_saas_config(company_name="Nueva Plataforma", has_products=0)
+
+	assert result["success"] is True
+	assert fake_config.saved is True
+	assert fake_config.has_products == 0
+	assert created_docs == []
+
+
+def test_update_saas_config_does_not_bootstrap_service_permissions_when_services_disabled(monkeypatch):
+	created_docs = []
+
+	class _CoreFeatureMeta:
+		def has_field(self, fieldname):
+			return fieldname in {
+				"company_name",
+				"company_tax_id",
+				"company_address",
+				"company_phone",
+				"company_email",
+				"company_abbr",
+				"default_distribution_warehouse",
+				"default_cash_account",
+				"default_bank_account",
+				"ticket_header",
+				"ticket_footer",
+				"print_logo",
+				"print_tax_id",
+				"print_address",
+				"print_contact",
+			}
+
+	class _FakeCache:
+		def get_value(self, key):
+			return None
+
+		def set_value(self, key, value):
+			return None
+
+	class _ServicesDisabledConfig(_FakeSaaSConfig):
+		def __init__(self):
+			super().__init__()
+			self.has_services = 0
+			self.saved = False
+
+		def save(self, ignore_permissions=False):
+			self.saved = True
+			return self
+
+	fake_config = _ServicesDisabledConfig()
+	service_setup_calls = []
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe.local, "site", "test.localhost", raising=False)
+	monkeypatch.setattr(frappe, "get_roles", lambda user=None: ["System Manager"])
+	monkeypatch.setattr(frappe, "get_meta", lambda doctype: _CoreFeatureMeta() if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(
+		frappe,
+		"get_doc",
+		lambda doctype, *args, **kwargs: fake_config if doctype == "SaaS Feature Config" else created_docs.append((doctype, args, kwargs)) or SimpleNamespace(insert=lambda ignore_permissions=False: None),
+	)
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: fake_config if doctype == "SaaS Feature Config" else None)
+	monkeypatch.setattr(frappe.db, "exists", lambda doctype, name=None, *args, **kwargs: doctype == "Custom Field")
+	monkeypatch.setattr(frappe.db, "commit", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "clear_cache", lambda *args, **kwargs: None)
+	monkeypatch.setattr(frappe, "cache", lambda: _FakeCache())
+	monkeypatch.setattr(saas_api, "setup_service_role_permissions", lambda: service_setup_calls.append("called"))
+	monkeypatch.setattr(saas_api, "_is_platform_master_site", lambda: False)
+
+	result = saas_api.update_saas_config(company_name="Nueva Plataforma", has_services=0)
+
+	assert result["success"] is True
+	assert fake_config.saved is True
+	assert fake_config.has_services == 0
+	assert service_setup_calls == []
+	assert created_docs == []
+
+
+def test_get_reservations_activation_contract_reports_requirements():
+	class _DisabledReservationConfig:
+		has_reservations = 0
+
+		def get(self, key, default=None):
+			return getattr(self, key, default)
+
+	original_user = frappe.session.user
+	original_get_roles = frappe.get_roles
+	original_get_cached_doc = frappe.get_cached_doc
+	original_master_gate = saas_api._is_platform_master_site
+
+	try:
+		frappe.session.user = "Administrator"
+		frappe.get_roles = lambda user=None: ["System Manager"]
+		saas_api._is_platform_master_site = lambda: False
+		frappe.get_cached_doc = lambda doctype, name=None: _DisabledReservationConfig()
+
+		response = saas_api.get_reservations_activation_contract()
+
+		assert response["module"] == "reservations"
+		assert response["activation"]["current_status"]["enabled"] is False
+		assert response["activation"]["current_status"]["state"] == "disabled"
+		assert [field["fieldname"] for field in response["activation"]["required_fields"]] == [
+			"reservation_item_code",
+			"max_reservation_assets",
+			"default_event_items",
+		]
+		assert any(
+			dependency["feature"] == "has_products" and dependency["required"] is True
+			for dependency in response["activation"]["suggested_dependencies"]
+		)
+	finally:
+		frappe.session.user = original_user
+		frappe.get_roles = original_get_roles
+		frappe.get_cached_doc = original_get_cached_doc
+		saas_api._is_platform_master_site = original_master_gate
 
 
 def test_setup_mexican_taxes_falls_back_when_direct_liabilities_missing():
@@ -256,10 +1647,14 @@ def test_tenant_status_token_and_redaction():
 		frappe.enqueue = lambda *args, **kwargs: None
 
 		result = saas_api.request_tenant(
-			subdomain,
-			"Safety Test Company",
-			"admin@safety.test",
-			"SecretPassword123!",
+			subdomain=subdomain,
+			company_name="Safety Test Company",
+			company_tax_id="RFC-SAFETY",
+			company_address="Calle Seguridad 123",
+			company_phone="5551234567",
+			company_email="ops@safety.test",
+			admin_email="admin@safety.test",
+			admin_password="SecretPassword123!",
 		)
 
 		assert result.get("success") is True
@@ -307,6 +1702,10 @@ def test_tenant_status_accepts_workspace_id_alias():
 		result = saas_api.request_tenant(
 			workspace_id=workspace_id,
 			company_name="Safety Test Company",
+			company_tax_id="RFC-SAFETY",
+			company_address="Calle Seguridad 123",
+			company_phone="5551234567",
+			company_email="ops@safety.test",
 			admin_email="admin@safety.test",
 			admin_password="SecretPassword123!",
 		)
@@ -330,9 +1729,86 @@ def test_tenant_status_accepts_workspace_id_alias():
 		frappe.set_user(original_user)
 
 
+def test_get_features_fails_closed_without_platform_config(monkeypatch):
+	class _EmptyFeatureConfig:
+		primary_color = ""
+		has_pos = 0
+		has_production = 0
+		has_logistics = 0
+		has_reservations = 0
+		has_wholesale = 0
+		has_mexico_taxes = 0
+		has_services = 0
+		has_products = 0
+		has_purchasing = 0
+		reservation_item_code = ""
+		max_reservation_assets = 0
+		default_event_items = "[]"
+		custom_country = ""
+		custom_currency = ""
+		company_name = ""
+		company_logo = ""
+		company_tax_id = ""
+		company_address = ""
+		company_phone = ""
+		company_email = ""
+		ticket_header = ""
+		ticket_footer = ""
+		print_logo = 0
+		print_tax_id = 0
+		print_address = 0
+		print_contact = 0
+		is_active = 0
+		max_branches = 0
+
+		def get(self, key, default=None):
+			return getattr(self, key, default)
+
+	monkeypatch.setattr(saas_api, "setup_company_identity_fields", lambda: None)
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: _EmptyFeatureConfig())
+
+	response = saas_api.get_features()
+
+	assert response["setup_required"] is True
+	assert response["client_name"] == ""
+	assert response["company_name"] == ""
+	assert "La Paletixa" not in response["error"]
+
+
+def test_get_pos_profile_fails_closed_when_pos_is_disabled(monkeypatch):
+	class _DisabledPosConfig:
+		has_pos = 0
+
+		def get(self, key, default=None):
+			return getattr(self, key, default)
+
+	def _unexpected(*args, **kwargs):
+		raise AssertionError("POS data should not be queried when POS is disabled")
+
+	monkeypatch.setattr(frappe.session, "user", "Administrator", raising=False)
+	monkeypatch.setattr(frappe, "get_cached_doc", lambda doctype, name=None: _DisabledPosConfig())
+	monkeypatch.setattr(frappe, "get_roles", _unexpected)
+	monkeypatch.setattr(frappe, "get_all", _unexpected)
+	monkeypatch.setattr(frappe, "get_doc", _unexpected)
+
+	with pytest.raises(frappe.PermissionError):
+		saas_api.get_pos_profile()
+
+
+def test_is_platform_master_site_raises_when_platform_sites_are_missing(monkeypatch):
+	def _missing_platform_sites():
+		frappe.throw("missing platform sites", frappe.ValidationError)
+
+	monkeypatch.setattr(infrastructure, "resolve_platform_master_sites", _missing_platform_sites)
+
+	with pytest.raises(frappe.ValidationError):
+		infrastructure.is_platform_master_site("frontend")
+
+
 def test_tenant_active_gate_fails_closed():
 	original_site = frappe.local.site
 	original_form_dict = getattr(frappe.local, "form_dict", None)
+	original_request = getattr(frappe.local, "request", None)
 	original_get_cached_doc = frappe.get_cached_doc
 	original_master_gate = saas_api._is_platform_master_site
 
@@ -348,20 +1824,10 @@ def test_tenant_active_gate_fails_closed():
 				return 1
 			return default
 
-	def _raise_config_error(*args, **kwargs):
-		raise Exception("boom")
-
 	try:
 		frappe.local.site = "tenant.localhost"
 		frappe.local.form_dict = frappe._dict({"cmd": "paletixa_saas.paletixa_saas.api.some_protected_call"})
 		saas_api._is_platform_master_site = lambda: False
-
-		frappe.get_cached_doc = _raise_config_error
-		try:
-			saas_api.validate_tenant_is_active()
-			raise AssertionError("Expected PermissionError when SaaS Feature Config lookup fails")
-		except frappe.PermissionError:
-			pass
 
 		frappe.get_cached_doc = lambda *args, **kwargs: _InactiveConfig()
 		try:
@@ -372,11 +1838,33 @@ def test_tenant_active_gate_fails_closed():
 
 		frappe.get_cached_doc = lambda *args, **kwargs: _ActiveConfig()
 		saas_api.validate_tenant_is_active()
+
+		def _missing_master_site_lookup(*args, **kwargs):
+			raise Exception("missing platform sites")
+
+		saas_api._is_platform_master_site = _missing_master_site_lookup
+		frappe.get_cached_doc = lambda *args, **kwargs: _ActiveConfig()
+		frappe.local.form_dict = frappe._dict({"cmd": "paletixa_saas.paletixa_saas.api.get_features"})
+		saas_api.validate_tenant_is_active()
+
+		frappe.local.form_dict = frappe._dict({"cmd": "paletixa_saas.paletixa_saas.api.some_protected_call"})
+		saas_api.validate_tenant_is_active()
 	finally:
 		saas_api._is_platform_master_site = original_master_gate
 		frappe.get_cached_doc = original_get_cached_doc
 		frappe.local.site = original_site
 		frappe.local.form_dict = original_form_dict
+		frappe.local.request = original_request
+
+
+def test_primary_master_site_prefers_frontend_over_erpadmin_in_dev():
+	original_resolve = saas_api._resolve_platform_master_sites
+
+	try:
+		saas_api._resolve_platform_master_sites = lambda: {"frontend", "erpadmin"}
+		assert saas_api._get_primary_master_site() == "frontend"
+	finally:
+		saas_api._resolve_platform_master_sites = original_resolve
 
 
 def test_tenant_admin_permission_allows_tenant_admin_and_blocks_master_site():
@@ -389,6 +1877,12 @@ def test_tenant_admin_permission_allows_tenant_admin_and_blocks_master_site():
 		frappe.get_roles = lambda user=None: []
 		saas_api._is_platform_master_site = lambda: False
 
+		saas_api.check_tenant_admin_permission()
+
+		def _missing_platform_sites():
+			raise Exception("missing platform sites")
+
+		saas_api._is_platform_master_site = _missing_platform_sites
 		saas_api.check_tenant_admin_permission()
 
 		saas_api._is_platform_master_site = lambda: True
@@ -485,9 +1979,13 @@ def run():
 	print("Running backend safety regression checks...")
 	test_update_saas_config_uses_incoming_company_name_for_reservations()
 	test_update_saas_config_ignores_invalid_max_reservation_assets()
+	test_update_saas_config_skips_reservation_validation_when_disabled()
+	test_get_features_omits_reservation_defaults_when_disabled()
+	test_get_reservations_activation_contract_reports_requirements()
 	test_setup_mexican_taxes_falls_back_when_direct_liabilities_missing()
 	test_tenant_status_token_and_redaction()
 	test_tenant_active_gate_fails_closed()
+	test_create_wholesale_sale_blocks_non_privileged_authenticated_users_before_document_creation()
 	test_audit_safe_wholesale_cancellation()
 	test_audit_safe_event_cancellation()
 	print("All backend safety regression checks passed.")

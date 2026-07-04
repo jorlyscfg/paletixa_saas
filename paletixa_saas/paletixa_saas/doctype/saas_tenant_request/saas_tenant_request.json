@@ -18,17 +18,41 @@
     "unique": 1,
     "reqd": 1
    },
-  {
-   "fieldname": "company_name",
-   "fieldtype": "Data",
-   "label": "Nombre de la Empresa",
-   "reqd": 1
-  },
-  {
-   "fieldname": "admin_email",
-   "fieldtype": "Data",
-   "label": "Email del Administrador",
-   "reqd": 1
+   {
+    "fieldname": "company_name",
+    "fieldtype": "Data",
+    "label": "Nombre de la Empresa",
+    "reqd": 1
+   },
+    {
+     "fieldname": "company_tax_id",
+     "fieldtype": "Data",
+     "label": "Tax ID de la Empresa",
+     "reqd": 1
+    },
+    {
+     "fieldname": "company_address",
+     "fieldtype": "Small Text",
+     "label": "Dirección de la Empresa",
+     "reqd": 1
+    },
+    {
+     "fieldname": "company_phone",
+     "fieldtype": "Data",
+     "label": "Teléfono de la Empresa",
+     "reqd": 1
+    },
+    {
+     "fieldname": "company_email",
+     "fieldtype": "Data",
+     "label": "Email de la Empresa",
+     "reqd": 1
+    },
+   {
+    "fieldname": "admin_email",
+    "fieldtype": "Data",
+    "label": "Email del Administrador",
+    "reqd": 1
   },
   {
    "fieldname": "admin_password",

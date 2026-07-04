@@ -1,8 +1,13 @@
 import json
+import secrets
+import time
 import traceback
 
 import frappe
 
+from paletixa_saas.config.infrastructure import (
+	_is_development_context,
+)
 from paletixa_saas.config.infrastructure import (
 	get_bench_path as _get_bench_path,
 )
@@ -38,10 +43,54 @@ def is_tenant_admin_user(user=None):
 	return user == "Administrator" or normalized_user.startswith("admin@") or normalized_user.startswith("admin.")
 
 
+def is_service_operator_user(user=None):
+	user = user or frappe.session.user
+	if not user or user == "Guest":
+		return False
+
+	if is_tenant_admin_user(user):
+		return True
+
+	normalized_user = user.lower()
+	return (
+		normalized_user.startswith("cajero.")
+		or normalized_user.startswith("produccion@")
+		or normalized_user.startswith("logistica@")
+	)
+
+
+def _is_system_manager(user=None):
+	user = user or frappe.session.user
+	if not user or user == "Guest":
+		return False
+
+	return "System Manager" in frappe.get_roles(user)
+
+
+def _user_has_pos_profile_access(pos_profile, user=None):
+	user = user or frappe.session.user
+	if not user or user == "Guest":
+		return False
+
+	if _is_system_manager(user):
+		return True
+
+	return bool(frappe.db.exists("POS Profile User", {"parent": pos_profile, "user": user}))
+
+
 def _get_primary_master_site():
 	master_sites = sorted(_resolve_platform_master_sites())
+	preferred_sites = ("frontend.localhost", "frontend", "frontend.local", "erpadmin")
+	for preferred_site in preferred_sites:
+		if preferred_site in master_sites:
+			return preferred_site
 	if not master_sites:
-		frappe.throw(frappe._("No se pudo resolver el sitio maestro."), frappe.ValidationError)
+		frappe.throw(
+			frappe._(
+				"Faltan los sitios maestros de la plataforma. Configurá platform_master_sites en site_config.json o PLATFORM_MASTER_SITES."
+			),
+			frappe.ValidationError,
+		)
 	return master_sites[0]
 
 
@@ -52,19 +101,186 @@ def _resolve_workspace_id(subdomain=None, workspace_id=None):
 	return identifier.lower().strip()
 
 
+def _reservations_are_active(config, has_reservations=None):
+	if has_reservations is None:
+		return bool(frappe.utils.cint(config.get("has_reservations")))
+	return bool(frappe.utils.cint(has_reservations))
+
+
+def _reservations_disabled_response():
+	return {"success": False, "error": frappe._("El módulo de reservas está deshabilitado.")}
+
+
+def _event_booking_attempt_key(guest_phone, guest_name):
+	remote_addr = getattr(getattr(frappe.local, "request", None), "remote_addr", None) or "unknown"
+	identity = normalize_phone_number(guest_phone or guest_name or "anonymous")
+	return f"event_booking_attempts:{remote_addr}:{identity}"
+
+
+def _event_booking_is_rate_limited(guest_phone, guest_name):
+	now = int(time.time())
+	cache_key = _event_booking_attempt_key(guest_phone, guest_name)
+	history = frappe.cache().get_value(cache_key) or []
+	history = [ts for ts in history if now - int(ts) < 600]
+	if len(history) >= 5:
+		return True
+	history.append(now)
+	frappe.cache().set_value(cache_key, history)
+	return False
+
+
+def _services_are_active(config):
+	if config is None:
+		return True
+	has_services = config.get("has_services")
+	return bool(frappe.utils.cint(has_services if has_services is not None else 1))
+
+
+def _wholesale_is_active(config):
+	if config is None:
+		return True
+	has_wholesale = config.get("has_wholesale")
+	return bool(frappe.utils.cint(has_wholesale if has_wholesale is not None else 1))
+
+
+def _wholesale_disabled_response():
+	return {
+		"success": False,
+		"error": frappe._("El módulo de mayoristas está deshabilitado."),
+	}
+
+
+def _reservations_activation_requirements():
+	return [
+		{
+			"fieldname": "reservation_item_code",
+			"label": "Artículo Reservable",
+			"fieldtype": "Link",
+			"options": "Item",
+			"required": True,
+			"description": "Artículo físico que se reserva para cada evento.",
+		},
+		{
+			"fieldname": "max_reservation_assets",
+			"label": "Cantidad Total de Carritos / Recursos",
+			"fieldtype": "Int",
+			"required": True,
+			"description": "Cantidad total disponible para reservar.",
+		},
+		{
+			"fieldname": "default_event_items",
+			"label": "Plantilla de Productos Pre-cargados",
+			"fieldtype": "Text",
+			"required": True,
+			"description": "Lista JSON de productos que se precargan en la reserva.",
+		},
+	]
+
+
+def _reservations_suggested_dependencies():
+	return [
+		{
+			"feature": "has_products",
+			"label": "Productos e Inventario",
+			"required": True,
+			"reason": "Reservas usa el catálogo para precargar productos y completar la entrega.",
+		},
+		{
+			"feature": "has_wholesale",
+			"label": "Venta Mayorista",
+			"required": False,
+			"reason": "La confirmación de reservas reutiliza el flujo de pedidos y facturación.",
+		},
+	]
+
+
+def _reservations_activation_contract(config=None):
+	reservations_active = bool(config and _reservations_are_active(config))
+	return {
+		"module": "reservations",
+		"activation": {
+			"current_status": {
+				"enabled": reservations_active,
+				"state": "enabled" if reservations_active else "disabled",
+			},
+			"required_fields": _reservations_activation_requirements(),
+			"suggested_dependencies": _reservations_suggested_dependencies(),
+		},
+	}
+
+
+def _saas_feature_config_has_field(fieldname):
+	try:
+		return bool(frappe.get_meta("SaaS Feature Config").has_field(fieldname))
+	except Exception:
+		return False
+
+
+def _safe_is_platform_master_site(site_name=None):
+	try:
+		if site_name is None:
+			return bool(_is_platform_master_site())
+		return bool(_is_platform_master_site(site_name))
+	except Exception:
+		return False
+
+
+def _saas_debug_context():
+	request = getattr(frappe.local, "request", None)
+	cookies = getattr(request, "cookies", None)
+	form_dict = getattr(frappe.local, "form_dict", None)
+	cmd = getattr(form_dict, "cmd", None)
+	if cmd is None and hasattr(form_dict, "get"):
+		cmd = form_dict.get("cmd")
+	return {
+		"site": getattr(frappe.local, "site", None),
+		"user": getattr(frappe.session, "user", None),
+		"cmd": cmd,
+		"path": getattr(request, "path", None),
+		"tenant_name": cookies.get("tenant_name") if hasattr(cookies, "get") else None,
+	}
+
+
+def _saas_debug_log(event, **context):
+	if not _is_development_context():
+		return
+
+	payload = _saas_debug_context()
+	payload.update(context)
+	frappe.logger("paletixa_saas").warning(
+		f"[saas-debug] {event} {json.dumps(payload, default=str, ensure_ascii=True, sort_keys=True)}"
+	)
+
+
 def check_tenant_admin_permission():
-	if not frappe.session.user or frappe.session.user == "Guest":
+	_saas_debug_log("check_tenant_admin_permission:start")
+	user = frappe.session.user
+	if not user or user == "Guest":
+		_saas_debug_log("check_tenant_admin_permission:deny", reason="guest")
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
-	if _is_platform_master_site():
+	if _safe_is_platform_master_site():
+		_saas_debug_log("check_tenant_admin_permission:deny", reason="master_site")
 		frappe.throw(
 			frappe._("Acceso denegado: Este endpoint solo está disponible en sitios de tenant."),
 			frappe.PermissionError,
 		)
 
-	if is_tenant_admin_user() or "System Manager" in frappe.get_roles(frappe.session.user):
+	roles = frappe.get_roles(user)
+	is_tenant_admin = is_tenant_admin_user(user)
+	is_system_manager = "System Manager" in roles
+	_saas_debug_log(
+		"check_tenant_admin_permission:resolved",
+		roles=roles,
+		is_tenant_admin=is_tenant_admin,
+		is_system_manager=is_system_manager,
+	)
+
+	if is_tenant_admin or is_system_manager:
+		_saas_debug_log("check_tenant_admin_permission:allow")
 		return
 
+	_saas_debug_log("check_tenant_admin_permission:deny", reason="missing_role")
 	frappe.throw(frappe._("No tenés permisos para realizar esta acción"), frappe.PermissionError)
 
 
@@ -187,6 +403,8 @@ def setup_company_identity_fields():
 	created = []
 	for f in fields:
 		name = f"SaaS Feature Config-{f['fieldname']}"
+		if _saas_feature_config_has_field(f["fieldname"]):
+			continue
 		if not frappe.db.exists("Custom Field", name):
 			doc = frappe.get_doc(
 				{
@@ -207,7 +425,13 @@ def setup_company_identity_fields():
 		frappe.db.commit()
 		frappe.clear_cache(doctype="SaaS Feature Config")
 
-	setup_saas_role_permissions()
+	try:
+		config = frappe.get_cached_doc("SaaS Feature Config")
+	except Exception:
+		config = None
+
+	if _services_are_active(config):
+		setup_service_role_permissions()
 	frappe.cache().set_value(cache_key, 1)
 
 
@@ -216,8 +440,9 @@ def get_features():
 	try:
 		setup_company_identity_fields()
 		config = frappe.get_cached_doc("SaaS Feature Config")
+		reservations_active = _reservations_are_active(config)
 		return {
-			"client_name": get_platform_company_name(allow_demo_fallback=True),
+			"client_name": get_platform_company_name(),
 			"colors": {
 				"primary": config.primary_color or "#1abc9c",
 			},
@@ -232,13 +457,13 @@ def get_features():
 				"products": bool(config.get("has_products") if config.get("has_products") is not None else 1),
 				"purchasing": bool(config.get("has_purchasing", 0)),
 			},
-			"reservation_item_code": config.get("reservation_item_code") or "Carrito Paletero",
-			"max_reservation_assets": int(config.get("max_reservation_assets") or 0),
-			"default_event_items": config.get("default_event_items") or "[]",
+			"reservation_item_code": (config.get("reservation_item_code") or "Carrito Paletero") if reservations_active else "",
+			"max_reservation_assets": int(config.get("max_reservation_assets") or 0) if reservations_active else 0,
+			"default_event_items": (config.get("default_event_items") or "[]") if reservations_active else "[]",
 			"custom_country": config.get("custom_country") or "Mexico",
 			"custom_currency": config.get("custom_currency") or "MXN",
-			# Company Identity & Ticket Customizer
-			"company_name": config.get("company_name") or get_platform_company_name(allow_demo_fallback=True),
+			# Company identity and ticket runtime defaults
+			"company_name": config.get("company_name") or get_platform_company_name(),
 			"company_logo": config.get("company_logo") or config.get("client_logo") or "",
 			"company_tax_id": config.get("company_tax_id") or "",
 			"company_address": config.get("company_address") or "",
@@ -255,10 +480,11 @@ def get_features():
 				config.get("max_branches", 3) if config.get("max_branches") is not None else 3
 			),
 		}
-	except Exception as e:
+	except frappe.ValidationError as e:
 		return {
 			"error": str(e),
-			"client_name": "La Paletixa",
+			"setup_required": True,
+			"client_name": "",
 			"colors": {
 				"primary": "#1abc9c",
 			},
@@ -267,18 +493,18 @@ def get_features():
 				"production": False,
 				"logistics": False,
 				"reservations": False,
-				"wholesale": True,
+				"wholesale": False,
 				"mexico_taxes": False,
-				"services": True,
-				"products": True,
+				"services": False,
+				"products": False,
 				"purchasing": False,
 			},
-			"reservation_item_code": "Carrito Paletero",
+			"reservation_item_code": "",
 			"max_reservation_assets": 0,
 			"default_event_items": "[]",
 			"custom_country": "Mexico",
 			"custom_currency": "MXN",
-			"company_name": "La Paletixa",
+			"company_name": "",
 			"company_logo": "",
 			"company_tax_id": "",
 			"company_address": "",
@@ -286,13 +512,62 @@ def get_features():
 			"company_email": "",
 			"ticket_header": "",
 			"ticket_footer": "",
-			"print_logo": True,
-			"print_tax_id": True,
-			"print_address": True,
-			"print_contact": True,
-			"is_active": True,
-			"max_branches": 3,
+			"print_logo": False,
+			"print_tax_id": False,
+			"print_address": False,
+			"print_contact": False,
+			"is_active": False,
+			"max_branches": 0,
 		}
+	except Exception as e:
+		return {
+			"error": str(e),
+			"setup_required": True,
+			"client_name": "",
+			"colors": {
+				"primary": "#1abc9c",
+			},
+			"features": {
+				"pos": False,
+				"production": False,
+				"logistics": False,
+				"reservations": False,
+				"wholesale": False,
+				"mexico_taxes": False,
+				"services": False,
+				"products": False,
+				"purchasing": False,
+			},
+			"reservation_item_code": "",
+			"max_reservation_assets": 0,
+			"default_event_items": "[]",
+			"custom_country": "Mexico",
+			"custom_currency": "MXN",
+			"company_name": "",
+			"company_logo": "",
+			"company_tax_id": "",
+			"company_address": "",
+			"company_phone": "",
+			"company_email": "",
+			"ticket_header": "",
+			"ticket_footer": "",
+			"print_logo": False,
+			"print_tax_id": False,
+			"print_address": False,
+			"print_contact": False,
+			"is_active": False,
+			"max_branches": 0,
+		}
+
+
+@frappe.whitelist()
+def get_reservations_activation_contract():
+	check_tenant_admin_permission()
+	try:
+		config = frappe.get_cached_doc("SaaS Feature Config")
+	except Exception:
+		config = None
+	return _reservations_activation_contract(config)
 
 
 def sync_event_warehouses(company_name, max_assets):
@@ -427,12 +702,41 @@ def update_saas_config(
 	has_products=None,
 	has_purchasing=None,
 ):
+	_saas_debug_log(
+		"update_saas_config:start",
+		incoming_company_name=company_name,
+		incoming_company_abbr=company_abbr,
+		has_company_logo=company_logo is not None,
+		has_company_address=company_address is not None,
+	)
 	check_tenant_admin_permission()
 
 	# Asegurar que existan los campos de marca
 	setup_company_identity_fields()
 	config = frappe.get_doc("SaaS Feature Config")
-	effective_company_name = (company_name or "").strip() or get_platform_company_name()
+	requested_company_name = (company_name or "").strip()
+	if requested_company_name:
+		effective_company_name = requested_company_name
+		_saas_debug_log(
+			"update_saas_config:company_name_from_request",
+			requested_company_name=requested_company_name,
+		)
+	else:
+		effective_company_name = get_platform_company_name()
+		_saas_debug_log(
+			"update_saas_config:company_name_from_platform_default",
+			resolved_company_name=effective_company_name,
+			reason="fresh_tenant_or_blank_company_name",
+		)
+
+	_saas_debug_log(
+		"update_saas_config:company_resolved",
+		requested_company_name=requested_company_name,
+		effective_company_name=effective_company_name,
+		current_config_company_name=config.get("company_name"),
+	)
+	current_reservations_active = _reservations_are_active(config)
+	reservations_active_after_update = _reservations_are_active(config, has_reservations)
 
 	if primary_color is not None:
 		config.primary_color = primary_color
@@ -458,29 +762,31 @@ def update_saas_config(
 	if has_products is not None:
 		config.has_products = int(has_products)
 
-	if reservation_item_code is not None:
-		config.reservation_item_code = reservation_item_code
+	if reservations_active_after_update:
+		if reservation_item_code is not None:
+			config.reservation_item_code = reservation_item_code
 
-	if max_reservation_assets is not None:
-		current_max_raw = config.get("max_reservation_assets")
-		try:
-			current_max = int(current_max_raw or 0)
-		except (TypeError, ValueError):
-			current_max = 0
-		try:
-			new_max = int(max_reservation_assets)
-		except (TypeError, ValueError):
-			new_max = current_max
-		else:
-			is_res_active = (has_reservations is not None and int(has_reservations)) or (
-				has_reservations is None and bool(config.has_reservations)
-			)
-			if is_res_active:
-				sync_event_warehouses(effective_company_name, new_max)
-			config.max_reservation_assets = new_max
+		if max_reservation_assets is not None:
+			current_max_raw = config.get("max_reservation_assets")
+			try:
+				current_max = int(current_max_raw or 0)
+			except (TypeError, ValueError):
+				current_max = 0
+			try:
+				new_max = int(max_reservation_assets)
+			except (TypeError, ValueError):
+				new_max = current_max
+			else:
+				if current_reservations_active or reservations_active_after_update:
+					sync_event_warehouses(effective_company_name, new_max)
+				config.max_reservation_assets = new_max
 
-	if default_event_items is not None:
-		config.default_event_items = default_event_items
+		if default_event_items is not None:
+			config.default_event_items = default_event_items
+	else:
+		config.reservation_item_code = ""
+		config.max_reservation_assets = 0
+		config.default_event_items = "[]"
 
 	if custom_country is not None:
 		config.custom_country = custom_country
@@ -534,8 +840,6 @@ def update_saas_config(
 
 	if has_mexico_taxes is not None:
 		config.has_mexico_taxes = int(has_mexico_taxes)
-		if int(has_mexico_taxes) == 1:
-			setup_mexican_taxes_and_fields(effective_company_name)
 
 	if has_purchasing is not None:
 		config.has_purchasing = int(has_purchasing)
@@ -543,8 +847,31 @@ def update_saas_config(
 	config.save(ignore_permissions=True)
 	frappe.db.commit()
 	frappe.clear_cache(doctype="SaaS Feature Config")
+	_saas_debug_log(
+		"update_saas_config:success",
+		effective_company_name=effective_company_name,
+		stored_company_name=config.get("company_name"),
+	)
 
 	return {"success": True, "config": config.as_dict()}
+
+
+@frappe.whitelist()
+def activate_mexican_taxes(company_name=None):
+	check_tenant_admin_permission()
+
+	requested_company_name = (company_name or "").strip()
+	effective_company_name = requested_company_name or get_platform_company_name()
+
+	setup_mexican_taxes_and_fields(effective_company_name)
+
+	config = frappe.get_doc("SaaS Feature Config")
+	config.has_mexico_taxes = 1
+	config.save(ignore_permissions=True)
+	frappe.db.commit()
+	frappe.clear_cache(doctype="SaaS Feature Config")
+
+	return {"success": True, "company_name": effective_company_name}
 
 
 def clean_old_image_file(doc, method=None):
@@ -570,12 +897,26 @@ def get_templates():
 
 @frappe.whitelist(allow_guest=True)
 def get_item_barcodes():
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if not (
+		is_tenant_admin_user()
+		or frappe.session.user.startswith("cajero.")
+		or frappe.session.user.startswith("produccion@")
+		or frappe.session.user.startswith("logistica@")
+	):
+		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
+
 	return frappe.get_all("Item Barcode", fields=["parent", "barcode"], limit=1000)
 
 
 @frappe.whitelist(allow_guest=True)
 def get_active_items():
 	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _reservations_are_active(config):
+		return _reservations_disabled_response()
+
 	item_code = config.get("reservation_item_code") or "Carrito Paletero"
 	subgroups = ["Products"] + [
 		g.name for g in frappe.get_all("Item Group", filters={"parent_item_group": "Products"})
@@ -865,6 +1206,9 @@ def create_item_template(template_name, attributes_list, item_group="Products"):
 
 @frappe.whitelist()
 def create_custom_field():
+	if not _is_system_manager():
+		frappe.throw(frappe._("No tenés permisos para configurar el sistema"), frappe.PermissionError)
+
 	if not frappe.db.exists("Custom Field", "SaaS Feature Config-allow_pos_out_of_stock"):
 		doc = frappe.get_doc(
 			{
@@ -884,8 +1228,23 @@ def create_custom_field():
 	return {"success": True, "message": "Custom field already exists!"}
 
 
+def _ensure_pos_feature_enabled():
+	try:
+		config = frappe.get_cached_doc("SaaS Feature Config")
+	except Exception:
+		config = None
+
+	if not config or not bool(getattr(config, "has_pos", 0)):
+		frappe.throw(
+			frappe._("El módulo de punto de venta está desactivado en la configuración."),
+			frappe.PermissionError,
+		)
+
+
 @frappe.whitelist()
 def get_pos_profile(selected_profile=None):
+	_ensure_pos_feature_enabled()
+
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
@@ -1024,6 +1383,9 @@ def create_pos_opening(pos_profile, company, balance_details):
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
+	if not _user_has_pos_profile_access(pos_profile):
+		frappe.throw(frappe._("No tenés permisos para realizar esta acción."), frappe.PermissionError)
+
 	if isinstance(balance_details, str):
 		balance_details = frappe.parse_json(balance_details)
 
@@ -1055,12 +1417,9 @@ def close_pos_shift(pos_opening_entry, closing_details):
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
-	if isinstance(closing_details, str):
-		closing_details = frappe.parse_json(closing_details)
-
 	# Bloquear la fila de la apertura de caja para evitar condiciones de carrera por doble click o peticiones concurrentes
 	opening_status = frappe.db.sql(
-		"select status, pos_closing_entry from `tabPOS Opening Entry` where name = %s for update",
+		"select status, pos_closing_entry, user, pos_profile from `tabPOS Opening Entry` where name = %s for update",
 		(pos_opening_entry,),
 		as_dict=True,
 	)
@@ -1069,10 +1428,16 @@ def close_pos_shift(pos_opening_entry, closing_details):
 		frappe.throw(frappe._("La apertura de caja especificada no existe."))
 
 	status_info = opening_status[0]
+	if not _is_system_manager() and status_info.user != frappe.session.user:
+		frappe.throw(frappe._("No tenés permisos para realizar esta acción."), frappe.PermissionError)
+
 	if status_info.status == "Closed":
 		return {"success": True, "name": status_info.pos_closing_entry}
 	elif status_info.status != "Open":
 		frappe.throw(frappe._("La apertura especificada no está abierta o ya fue cerrada."))
+
+	if isinstance(closing_details, str):
+		closing_details = frappe.parse_json(closing_details)
 
 	opening_doc = frappe.get_doc("POS Opening Entry", pos_opening_entry)
 
@@ -1243,9 +1608,7 @@ def get_customer_orders_history(customer_name):
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
-	if "System Manager" not in frappe.get_roles(frappe.session.user) and not frappe.session.user.startswith(
-		"cajero."
-	):
+	if "System Manager" not in frappe.get_roles(frappe.session.user):
 		profile = get_customer_wholesale_profile()
 		if not profile or not profile.get("success") or profile.get("customer") != customer_name:
 			frappe.throw(frappe._("No tenés permisos para ver este historial."), frappe.PermissionError)
@@ -1274,26 +1637,29 @@ def get_all_customers():
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
-	if "System Manager" not in frappe.get_roles(frappe.session.user) and not frappe.session.user.startswith(
-		"cajero."
-	):
+	if not is_tenant_admin_user() and "System Manager" not in frappe.get_roles(frappe.session.user):
 		frappe.throw(frappe._("No tenés permisos para acceder a esta información."), frappe.PermissionError)
+
+	fields = [
+		"name",
+		"customer_name",
+		"mobile_no",
+		"email_id",
+		"territory",
+		"customer_group",
+	]
+	if frappe.get_meta("Customer").has_field("custom_wholesale_access_pin"):
+		fields.append("custom_wholesale_access_pin")
 
 	customers = frappe.get_all(
 		"Customer",
 		filters={"disabled": 0},
-		fields=[
-			"name",
-			"customer_name",
-			"mobile_no",
-			"email_id",
-			"territory",
-			"customer_group",
-			"custom_wholesale_access_pin",
-		],
+		fields=fields,
 		order_by="customer_name asc",
 		limit=200,
 	)
+	for customer in customers:
+		customer.setdefault("custom_wholesale_access_pin", None)
 	return customers
 
 
@@ -1362,6 +1728,8 @@ def setup_reservation_fields():
 	created = []
 	for f in fields:
 		name = f"SaaS Feature Config-{f['fieldname']}"
+		if _saas_feature_config_has_field(f["fieldname"]):
+			continue
 		if not frappe.db.exists("Custom Field", name):
 			doc = frappe.get_doc(
 				{
@@ -1442,109 +1810,163 @@ def create_event_booking(
 	if not items:
 		frappe.throw(frappe._("Debe agregar al menos un artículo para reservar."))
 
+	is_guest_request = not frappe.session.user or frappe.session.user == "Guest"
+	requested_advance_amount = float(advance_amount or 0)
+	if is_guest_request:
+		requested_advance_amount = 0.0
+
 	# Validar que si no está autenticado, proporcione sus datos
-	if (not frappe.session.user or frappe.session.user == "Guest") and not guest_name:
+	if is_guest_request and not guest_name:
 		frappe.throw(
 			frappe._("Debe iniciar sesión o proporcionar su nombre para la reserva."), frappe.PermissionError
 		)
 
 	config = frappe.get_cached_doc("SaaS Feature Config")
-	item_code = config.get("reservation_item_code") or "Carrito Paletero"
+	if not _reservations_are_active(config):
+		return _reservations_disabled_response()
 
-	parsed_items = items
-	if isinstance(parsed_items, str):
-		parsed_items = frappe.parse_json(parsed_items)
+	if is_guest_request and _event_booking_is_rate_limited(guest_phone, guest_name):
+		return {"success": False, "error": frappe._("No se pudo registrar la reserva de evento.")}
 
-	final_customer = customer
-	if (not final_customer or final_customer == "Público General") and guest_name:
-		# Buscar si ya existe un cliente con ese nombre o teléfono
-		existing = None
-		if guest_phone:
-			existing = frappe.db.get_value("Customer", {"mobile_no": guest_phone.strip()}, "name")
-		if not existing:
-			existing = frappe.db.get_value("Customer", {"customer_name": guest_name.strip()}, "name")
+	lock_name = f"event_booking:{delivery_date}"
+	lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_name,))
+	lock_acquired = bool(lock_result and lock_result[0][0] == 1)
+	if not lock_acquired:
+		frappe.throw(frappe._("No se pudo asegurar la fecha de reserva. Intentá nuevamente."), frappe.PermissionError)
 
-		if existing:
-			final_customer = existing
-		else:
-			doc = frappe.new_doc("Customer")
-			doc.customer_name = guest_name.strip()
-			doc.customer_type = "Individual"
-			doc.customer_group = "Individual"
-			doc.territory = "All Territories"
+	try:
+		availability = check_cart_availability(delivery_date)
+		if not availability.get("enabled", True):
+			return _reservations_disabled_response()
+		if int(availability.get("available_qty") or 0) <= 0:
+			return {"success": False, "error": frappe._("No hay carritos disponibles para esa fecha.")}
+
+		item_code = config.get("reservation_item_code") or "Carrito Paletero"
+		allowed_item_codes = {item.get("name") for item in get_active_items()}
+
+		parsed_items = items
+		if isinstance(parsed_items, str):
+			parsed_items = frappe.parse_json(parsed_items)
+
+		if is_guest_request:
+			customer = None
+		elif "System Manager" not in frappe.get_roles(frappe.session.user):
+			customer = None
+
+		final_customer = customer
+		if (not is_guest_request) and (not final_customer or final_customer == "Público General") and guest_name:
+			# Buscar si ya existe un cliente con ese nombre o teléfono
+			existing = None
 			if guest_phone:
-				doc.mobile_no = guest_phone.strip()
-			doc.flags.ignore_permissions = True
-			doc.insert(ignore_permissions=True)
-			final_customer = doc.name
+				existing = frappe.db.get_value("Customer", {"mobile_no": guest_phone.strip()}, "name")
+			if not existing:
+				existing = frappe.db.get_value("Customer", {"customer_name": guest_name.strip()}, "name")
 
-	if not final_customer:
-		final_customer = "Público General"
+			if existing:
+				final_customer = existing
+			else:
+				doc = frappe.new_doc("Customer")
+				doc.customer_name = guest_name.strip()
+				doc.customer_type = "Individual"
+				doc.customer_group = "Individual"
+				doc.territory = "All Territories"
+				if guest_phone:
+					doc.mobile_no = guest_phone.strip()
+				doc.flags.ignore_permissions = True
+				doc.insert(ignore_permissions=True)
+				final_customer = doc.name
 
-	company_name = get_platform_company_name()
-	warehouse = get_platform_distribution_warehouse()
+		if not final_customer:
+			final_customer = "Público General"
 
-	# 1. Crear el Sales Order nativo
-	so = frappe.new_doc("Sales Order")
-	so.company = company_name
-	so.customer = final_customer
-	so.delivery_date = delivery_date
-	so.selling_price_list = "Standard Selling"
+		company_name = get_platform_company_name()
+		warehouse = get_platform_distribution_warehouse()
 
-	# Agregar el recurso reservado
-	so.append(
-		"items",
-		{
-			"item_code": item_code,
-			"qty": 1,
-			"rate": 0.0,
-			"warehouse": warehouse,
-			"delivery_date": delivery_date,
-		},
-	)
+		# 1. Crear el Sales Order nativo
+		so = frappe.new_doc("Sales Order")
+		so.company = company_name
+		so.customer = final_customer
+		so.delivery_date = delivery_date
+		so.selling_price_list = "Standard Selling"
 
-	# Agregar los helados / paletas
-	for it in parsed_items:
+		# Agregar el recurso reservado
 		so.append(
 			"items",
 			{
-				"item_code": it.get("item_code"),
-				"qty": float(it.get("qty", 1)),
-				"rate": float(it.get("rate", 0)),
+				"item_code": item_code,
+				"qty": 1,
+				"rate": 0.0,
 				"warehouse": warehouse,
 				"delivery_date": delivery_date,
 			},
 		)
 
-	so.insert(ignore_permissions=True)
-	so.submit()
+		# Agregar los helados / paletas
+		for it in parsed_items:
+			item_code_input = it.get("item_code")
+			if item_code_input == item_code:
+				frappe.throw(frappe._("El artículo reservado no puede agregarse dentro de los productos del evento."))
+			if item_code_input not in allowed_item_codes:
+				frappe.throw(frappe._("El producto {0} no está permitido para reservas de evento.").format(item_code_input))
+			item_data = frappe.db.get_value(
+				"Item", item_code_input, ["name", "standard_rate", "disabled"], as_dict=True
+			)
+			if not item_data or item_data.disabled:
+				frappe.throw(frappe._("El producto {0} no existe o está inactivo.").format(item_code_input))
+			so.append(
+				"items",
+				{
+					"item_code": item_code_input,
+					"qty": float(it.get("qty", 1)),
+					"rate": float(item_data.standard_rate if item_data.standard_rate is not None else it.get("rate", 0)),
+					"warehouse": warehouse,
+					"delivery_date": delivery_date,
+				},
+			)
 
-	# 2. Registrar el anticipo cobrado (si es mayor a 0)
-	if float(advance_amount) > 0:
-		from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+		so.insert(ignore_permissions=True)
+		so.submit()
 
-		try:
-			pe = get_payment_entry("Sales Order", so.name, bank_amount=float(advance_amount))
-			pe.mode_of_payment = payment_mode
-			pe.reference_no = f"Anticipo Evento {delivery_date}"
-			pe.reference_date = frappe.utils.today()
+		# 2. Registrar el anticipo cobrado (si es mayor a 0)
+		can_register_advance_payment = not is_guest_request and "System Manager" in frappe.get_roles(frappe.session.user)
+		if can_register_advance_payment and requested_advance_amount > 0:
+			from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
-			# Asignar la cuenta contable según modo de pago
-			pe.paid_to = get_platform_payment_account(payment_mode)
+			try:
+				pe = get_payment_entry("Sales Order", so.name, bank_amount=requested_advance_amount)
+				pe.mode_of_payment = payment_mode
+				pe.reference_no = f"Anticipo Evento {delivery_date}"
+				pe.reference_date = frappe.utils.today()
 
-			pe.insert(ignore_permissions=True)
-			pe.submit()
-		except Exception as e:
-			# Registrar el error pero no tumbar la Sales Order ya confirmada
-			frappe.log_error(message=str(e), title="Error creando anticipo para Sales Order en Reserva")
+				# Asignar la cuenta contable según modo de pago
+				pe.paid_to = get_platform_payment_account(payment_mode)
+				pe.paid_amount = requested_advance_amount
+				pe.received_amount = requested_advance_amount
+				if pe.references:
+					pe.references[0].allocated_amount = requested_advance_amount
 
-	frappe.db.commit()
-	return {"success": True, "sales_order": so.name, "advance_paid": float(advance_amount)}
+				pe.insert(ignore_permissions=True)
+				pe.submit()
+			except Exception as e:
+				# Registrar el error pero no tumbar la Sales Order ya confirmada
+				frappe.log_error(message=str(e), title="Error creando anticipo para Sales Order en Reserva")
+
+		frappe.db.commit()
+		return {"success": True, "sales_order": so.name, "advance_paid": requested_advance_amount}
+	except Exception:
+		frappe.db.rollback()
+		raise
+	finally:
+		if lock_acquired:
+			frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_name,))
 
 
 @frappe.whitelist(allow_guest=True)
 def get_active_items_with_prices(warehouse=None):
 	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
 	item_code = config.get("reservation_item_code") or "Carrito Paletero"
 
 	subgroups = ["Products"] + [
@@ -1589,7 +2011,7 @@ def get_active_items_with_prices(warehouse=None):
 
 	# Obtener stock por almacén si corresponde
 	stock_map = {}
-	if warehouse:
+	if warehouse and (is_tenant_admin_user() or "System Manager" in frappe.get_roles(frappe.session.user)):
 		bins = frappe.get_all(
 			"Bin",
 			filters={"warehouse": warehouse, "item_code": ["in", [i.name for i in items]]},
@@ -1604,13 +2026,23 @@ def get_active_items_with_prices(warehouse=None):
 		)
 		item["retail_price"] = rates["retail_price"]
 		item["wholesale_price"] = rates["wholesale_price"]
-		item["actual_qty"] = stock_map.get(item.name, 0.0) if warehouse else None
+		item["actual_qty"] = stock_map.get(item.name, 0.0) if stock_map else None
 
 	return items
 
 
 @frappe.whitelist()
 def get_active_warehouses_with_stock():
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if not (is_tenant_admin_user() or "System Manager" in frappe.get_roles(frappe.session.user)):
+		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
+
 	company = get_platform_company_name()
 
 	query = """
@@ -1628,6 +2060,22 @@ def get_active_warehouses_with_stock():
 
 @frappe.whitelist()
 def create_wholesale_sale(customer=None, items=None, payment_amount=0, payment_mode="Cash", warehouse=None):
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if _safe_is_platform_master_site():
+		frappe.throw(
+			frappe._("Acceso denegado: Este endpoint solo está disponible en sitios de tenant."),
+			frappe.PermissionError,
+		)
+
+	if not (is_tenant_admin_user() or "System Manager" in frappe.get_roles(frappe.session.user)):
+		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
+
 	if not customer:
 		frappe.throw(frappe._("Debe proporcionar un cliente."))
 
@@ -1776,67 +2224,75 @@ def setup_wholesale_custom_fields():
 			frappe.db.commit()
 			frappe.clear_cache(doctype=f["dt"])
 
-	# Programmatic creation of custom DocType "SaaS Notification"
-	if not frappe.db.exists("DocType", "SaaS Notification"):
-		doc = frappe.get_doc(
-			{
-				"doctype": "DocType",
-				"name": "SaaS Notification",
-				"module": "Paletixa SaaS",
-				"custom": 1,
-				"autoname": "hash",
-				"fields": [
-					{
-						"fieldname": "title",
-						"label": "Title",
-						"fieldtype": "Data",
-						"reqd": 1,
-						"in_list_view": 1,
-					},
-					{
-						"fieldname": "message",
-						"label": "Message",
-						"fieldtype": "Small Text",
-						"in_list_view": 1,
-					},
-					{
-						"fieldname": "module",
-						"label": "Module",
-						"fieldtype": "Select",
-						"options": "Wholesale\nEvent",
-						"in_list_view": 1,
-					},
-					{
-						"fieldname": "reference_doctype",
-						"label": "Reference DocType",
-						"fieldtype": "Link",
-						"options": "DocType",
-					},
-					{
-						"fieldname": "reference_name",
-						"label": "Reference Name",
-						"fieldtype": "Data",
-						"in_list_view": 1,
-					},
-					{
-						"fieldname": "read",
-						"label": "Read",
-						"fieldtype": "Check",
-						"default": "0",
-						"in_list_view": 1,
-					},
-				],
-				"permissions": [
-					{"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "select": 1}
-				],
-			}
-		)
-		doc.insert(ignore_permissions=True)
-		frappe.db.commit()
+
+def ensure_saas_notification_doctype():
+	# Generic notification storage used by wholesale and event alerts.
+	if frappe.db.exists("DocType", "SaaS Notification"):
+		return
+
+	doc = frappe.get_doc(
+		{
+			"doctype": "DocType",
+			"name": "SaaS Notification",
+			"module": "Paletixa SaaS",
+			"custom": 1,
+			"autoname": "hash",
+			"fields": [
+				{
+					"fieldname": "title",
+					"label": "Title",
+					"fieldtype": "Data",
+					"reqd": 1,
+					"in_list_view": 1,
+				},
+				{
+					"fieldname": "message",
+					"label": "Message",
+					"fieldtype": "Small Text",
+					"in_list_view": 1,
+				},
+				{
+					"fieldname": "module",
+					"label": "Module",
+					"fieldtype": "Select",
+					"options": "Wholesale\nEvent",
+					"in_list_view": 1,
+				},
+				{
+					"fieldname": "reference_doctype",
+					"label": "Reference DocType",
+					"fieldtype": "Link",
+					"options": "DocType",
+				},
+				{
+					"fieldname": "reference_name",
+					"label": "Reference Name",
+					"fieldtype": "Data",
+					"in_list_view": 1,
+				},
+				{
+					"fieldname": "read",
+					"label": "Read",
+					"fieldtype": "Check",
+					"default": "0",
+					"in_list_view": 1,
+				},
+			],
+			"permissions": [
+				{"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "select": 1}
+			],
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
 
 
 @frappe.whitelist()
 def get_customer_wholesale_profile():
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
 	setup_wholesale_custom_fields()
 	user = frappe.session.user
 	if not user or user == "Guest":
@@ -1908,15 +2364,61 @@ def normalize_phone_number(phone):
 	return cleaned
 
 
+def _wholesale_session_cache_key(customer):
+	return f"wholesale_session:{customer}"
+
+
+def _wholesale_session_token_is_valid(customer, token):
+	if not customer or not token:
+		return False
+
+	cache_value = frappe.cache().get_value(_wholesale_session_cache_key(customer))
+	if not cache_value:
+		return False
+
+	try:
+		stored_token, created_at = str(cache_value).split(":", 1)
+	except ValueError:
+		return False
+
+	if stored_token != token:
+		return False
+
+	try:
+		issued_at = int(created_at)
+	except (TypeError, ValueError):
+		return False
+
+	return (int(time.time()) - issued_at) <= 86400
+
+
+def _wholesale_access_attempt_key(normalized_phone):
+	remote_addr = getattr(getattr(frappe.local, "request", None), "remote_addr", None) or "unknown"
+	return f"wholesale_access_attempts:{remote_addr}:{normalized_phone}"
+
+
+def _wholesale_access_is_rate_limited(normalized_phone):
+	now = int(time.time())
+	cache_key = _wholesale_access_attempt_key(normalized_phone)
+	history = frappe.cache().get_value(cache_key) or []
+	history = [ts for ts in history if now - int(ts) < 600]
+	if len(history) >= 5:
+		return True
+	history.append(now)
+	frappe.cache().set_value(cache_key, history)
+	return False
+
+
 @frappe.whitelist()
 def generate_customer_access_pin(customer_name):
 	user = frappe.session.user
 	if not user or user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
-	import random
+	if "System Manager" not in frappe.get_roles(user):
+		frappe.throw(frappe._("No tenés permisos para generar un PIN de acceso."), frappe.PermissionError)
 
-	pin = "".join([str(random.randint(0, 9)) for _ in range(6)])
+	pin = "".join([str(secrets.randbelow(10)) for _ in range(6)])
 
 	frappe.db.set_value("Customer", customer_name, "custom_wholesale_access_pin", pin)
 	frappe.db.commit()
@@ -1926,15 +2428,20 @@ def generate_customer_access_pin(customer_name):
 
 @frappe.whitelist(allow_guest=True)
 def validate_wholesale_access(phone, pin):
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
+	generic_error = {"success": False, "error": frappe._("No se pudo validar el acceso mayorista.")}
+
 	setup_wholesale_custom_fields()
 
 	if not phone or not pin:
-		return {
-			"success": False,
-			"error": frappe._("Falta ingresar el número de teléfono o el PIN de acceso."),
-		}
+		return generic_error
 
 	normalized = normalize_phone_number(phone)
+	if _wholesale_access_is_rate_limited(normalized):
+		return generic_error
 
 	customers = frappe.get_all(
 		"Customer",
@@ -1950,41 +2457,49 @@ def validate_wholesale_access(phone, pin):
 				break
 
 	if not matching_customer:
-		return {
-			"success": False,
-			"error": frappe._("No se encontró ningún cliente mayorista activo con este número de celular."),
-		}
+		return generic_error
 
 	stored_pin = matching_customer.custom_wholesale_access_pin
 	if not stored_pin or stored_pin.strip() != pin.strip():
-		return {"success": False, "error": frappe._("El PIN de acceso ingresado es incorrecto.")}
+		return generic_error
+
+	token = secrets.token_urlsafe(24)
+	frappe.cache().set_value(_wholesale_session_cache_key(matching_customer.name), f"{token}:{int(time.time())}")
 
 	return {
 		"success": True,
 		"customer": matching_customer.name,
 		"customer_name": matching_customer.customer_name,
 		"phone": matching_customer.mobile_no,
-		"token": "validated_session_" + matching_customer.name,
+		"token": token,
 	}
 
 
 @frappe.whitelist(allow_guest=True)
-def create_wholesale_order(items=None, metodo_pago=None, metodo_entrega=None, customer=None):
+def create_wholesale_order(items=None, metodo_pago=None, metodo_entrega=None, customer=None, wholesale_token=None):
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
 	setup_wholesale_custom_fields()
 	user = frappe.session.user
 
-	if not customer:
-		if not user or user == "Guest":
-			frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
-
+	if user and user != "Guest":
 		profile = get_customer_wholesale_profile()
 		if not profile.get("success"):
 			frappe.throw(profile.get("error"))
 
-		customer = profile.get("customer")
-	else:
-		if not frappe.db.exists("Customer", {"name": customer, "disabled": 0}):
-			frappe.throw(frappe._("Cliente inválido o inactivo."))
+		profile_customer = profile.get("customer")
+		if customer and customer != profile_customer:
+			frappe.throw(frappe._("No tenés permisos para crear pedidos para otro cliente."), frappe.PermissionError)
+		customer = profile_customer
+
+	if not user or user == "Guest":
+		if not _wholesale_session_token_is_valid(customer, wholesale_token):
+			frappe.throw(frappe._("Sesión mayorista inválida."), frappe.PermissionError)
+
+	if not customer or not frappe.db.exists("Customer", {"name": customer, "disabled": 0}):
+		frappe.throw(frappe._("Cliente inválido o inactivo."))
 
 	if isinstance(items, str):
 		items = frappe.parse_json(items)
@@ -2055,6 +2570,10 @@ def create_wholesale_order(items=None, metodo_pago=None, metodo_entrega=None, cu
 
 @frappe.whitelist()
 def get_pending_wholesale_orders():
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return []
+
 	setup_wholesale_custom_fields()
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
@@ -2101,6 +2620,10 @@ def get_pending_wholesale_orders():
 
 @frappe.whitelist()
 def complete_wholesale_order(sales_order_name, register_payment=True, payment_mode="Cash", warehouse=None):
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
@@ -2214,6 +2737,10 @@ def _cancel_sales_order_transaction_chain(sales_order_name):
 
 @frappe.whitelist()
 def cancel_wholesale_order(sales_order_name):
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return _wholesale_disabled_response()
+
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
 
@@ -2446,8 +2973,6 @@ def create_notification_on_order(doc, method=None):
 	Identifies if it's a wholesale order or an event booking, and creates the alert.
 	"""
 	try:
-		setup_wholesale_custom_fields()
-
 		# 1. Detect if it's a Wholesale Order
 		is_wholesale = False
 		if doc.get("custom_metodo_pago"):
@@ -2466,6 +2991,7 @@ def create_notification_on_order(doc, method=None):
 
 		# 3. Create the SaaS Notification if applicable
 		if is_wholesale or is_event:
+			ensure_saas_notification_doctype()
 			title = "Nuevo Pedido Mayorista" if is_wholesale else "Nueva Reserva de Evento"
 			module = "Wholesale" if is_wholesale else "Event"
 			message = (
@@ -2489,7 +3015,13 @@ def create_notification_on_order(doc, method=None):
 
 @frappe.whitelist()
 def get_unread_notifications():
-	setup_wholesale_custom_fields()
+	ensure_saas_notification_doctype()
+
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if "System Manager" not in frappe.get_roles(frappe.session.user):
+		frappe.throw(frappe._("No tenés permisos para acceder a esta información."), frappe.PermissionError)
 
 	# 1. Count unread notifications
 	unread_count = frappe.db.count("SaaS Notification", filters={"read": 0})
@@ -2516,6 +3048,12 @@ def mark_notification_as_read(notification_name):
 	if not notification_name:
 		frappe.throw(frappe._("Falta el nombre de la notificación."))
 
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if "System Manager" not in frappe.get_roles(frappe.session.user):
+		frappe.throw(frappe._("No tenés permisos para realizar esta acción."), frappe.PermissionError)
+
 	frappe.db.set_value("SaaS Notification", notification_name, "read", 1)
 	frappe.db.commit()
 	return {"success": True}
@@ -2530,10 +3068,6 @@ def get_admin_dashboard_metrics():
 		frappe.throw(
 			frappe._("No tenés permisos para acceder a esta información de reportes."), frappe.PermissionError
 		)
-
-	# Garantizar la existencia de campos personalizados en el tenant activo
-	setup_wholesale_custom_fields()
-	setup_reservation_fields()
 
 	today = frappe.utils.today()
 	company = get_platform_company_name()
@@ -2652,9 +3186,6 @@ def get_sales_report_data(start_date=None, end_date=None):
 			frappe._("No tenés permisos para acceder a esta información de reportes."), frappe.PermissionError
 		)
 
-	setup_wholesale_custom_fields()
-	setup_reservation_fields()
-
 	if not start_date:
 		start_date = frappe.utils.add_months(frappe.utils.today(), -1)
 	if not end_date:
@@ -2759,9 +3290,6 @@ def get_stock_report_data():
 		frappe.throw(
 			frappe._("No tenés permisos para acceder a esta información de reportes."), frappe.PermissionError
 		)
-
-	setup_wholesale_custom_fields()
-	setup_reservation_fields()
 
 	company = get_platform_company_name()
 	company_abbr = get_platform_company_abbr(company)
@@ -3096,6 +3624,9 @@ def setup_mexican_taxes_and_fields(company_name):
 @frappe.whitelist()
 def seed_demo_data():
 	"""Genera datos históricos transaccionales completos para La Paletixa en lapaletixa.localhost"""
+	if not (is_tenant_admin_user() or _is_system_manager()):
+		frappe.throw(frappe._("No tenés permisos para realizar esta acción."), frappe.PermissionError)
+
 	# 0. Asegurar contexto
 	company = "La Paletixa"
 	if not frappe.db.exists("Company", company):
@@ -4272,8 +4803,8 @@ def has_products_permission(doc, ptype=None, user=None):
 	return bool(config.get("has_products") if config.get("has_products") is not None else 1)
 
 
-def setup_saas_role_permissions():
-	doctypes = ["Timesheet", "Maintenance Visit", "Issue", "Stock Entry", "Delivery Note", "Purchase Receipt"]
+def setup_service_role_permissions():
+	doctypes = ["Timesheet", "Maintenance Visit", "Issue"]
 	for dt in doctypes:
 		if not frappe.db.exists("Custom DocPerm", {"parent": dt, "role": "System Manager", "permlevel": 0}):
 			try:
@@ -4304,6 +4835,45 @@ def setup_saas_role_permissions():
 				frappe.log_error(message=str(e), title=f"Error setting up Custom DocPerm for {dt}")
 
 	frappe.clear_cache()
+
+
+def setup_inventory_role_permissions():
+	doctypes = ["Stock Entry", "Delivery Note", "Purchase Receipt"]
+	for dt in doctypes:
+		if not frappe.db.exists("Custom DocPerm", {"parent": dt, "role": "System Manager", "permlevel": 0}):
+			try:
+				doc = frappe.get_doc(
+					{
+						"doctype": "Custom DocPerm",
+						"parent": dt,
+						"parenttype": "DocType",
+						"parentfield": "permissions",
+						"role": "System Manager",
+						"permlevel": 0,
+						"read": 1,
+						"write": 1,
+						"create": 1,
+						"delete": 1,
+						"submit": 1,
+						"cancel": 1,
+						"amend": 1,
+						"report": 1,
+						"export": 1,
+						"share": 1,
+						"print": 1,
+						"email": 1,
+					}
+				)
+				doc.insert(ignore_permissions=True)
+			except Exception as e:
+				frappe.log_error(message=str(e), title=f"Error setting up Custom DocPerm for {dt}")
+
+	frappe.clear_cache()
+
+
+def setup_saas_role_permissions():
+	setup_service_role_permissions()
+	setup_inventory_role_permissions()
 
 
 def get_services_permission_query_conditions(user):
@@ -4839,6 +5409,9 @@ def create_service_invoice(
 	if not frappe.session.user or frappe.session.user == "Guest":
 		frappe.throw(frappe._("Iniciá sesión para realizar esta acción"), frappe.PermissionError)
 
+	if not is_service_operator_user():
+		frappe.throw(frappe._("No tenés permisos para registrar servicios"), frappe.PermissionError)
+
 	if isinstance(items, str):
 		items = frappe.parse_json(items)
 
@@ -5049,7 +5622,31 @@ def get_db_root_credentials():
 	return _get_db_root_credentials()
 
 
-def _validate_tenant_request_payload(workspace_id, company_name, admin_email, admin_password):
+def _normalize_required_setup_field(value, label):
+	normalized = (value or "").strip()
+	if not normalized:
+		frappe.throw(frappe._("{0} es obligatorio.").format(label), frappe.ValidationError)
+	return normalized
+
+
+def _normalize_required_email_field(value, label):
+	normalized = _normalize_required_setup_field(value, label)
+	local_part, separator, domain = normalized.partition("@")
+	if not separator or not local_part or "." not in domain:
+		frappe.throw(frappe._("{0} es inválido.").format(label), frappe.ValidationError)
+	return normalized
+
+
+def _validate_tenant_request_payload(
+	workspace_id,
+	company_name,
+	admin_email,
+	admin_password,
+	company_tax_id,
+	company_address,
+	company_phone,
+	company_email,
+):
 	reserved_subdomains = _get_reserved_subdomains()
 
 	if not workspace_id or len(workspace_id) > 30:
@@ -5066,6 +5663,84 @@ def _validate_tenant_request_payload(workspace_id, company_name, admin_email, ad
 
 	if not admin_password or len(admin_password) < 8:
 		frappe.throw(frappe._("La contraseña del administrador debe tener al menos 8 caracteres."))
+
+	workspace_id = workspace_id.lower().strip()
+	company_name = _normalize_required_setup_field(company_name, frappe._("El nombre de la empresa"))
+	admin_email = _normalize_required_email_field(admin_email, frappe._("El email del administrador"))
+	company_tax_id = _normalize_required_setup_field(company_tax_id, frappe._("El tax ID de la empresa"))
+	company_address = _normalize_required_setup_field(company_address, frappe._("La dirección de la empresa"))
+	company_phone = _normalize_required_setup_field(company_phone, frappe._("El teléfono de la empresa"))
+	if not any(ch.isdigit() for ch in company_phone):
+		frappe.throw(frappe._("El teléfono de la empresa es inválido."), frappe.ValidationError)
+	company_email = _normalize_required_email_field(company_email, frappe._("El email de la empresa"))
+
+	return {
+		"workspace_id": workspace_id,
+		"company_name": company_name,
+		"admin_email": admin_email,
+		"admin_password": admin_password,
+		"company_tax_id": company_tax_id,
+		"company_address": company_address,
+		"company_phone": company_phone,
+		"company_email": company_email,
+	}
+
+
+def _tenant_workspace_availability(workspace_id):
+	import os
+	import re
+
+	workspace_id = _resolve_workspace_id(workspace_id=workspace_id)
+	if not workspace_id or len(workspace_id) > 30:
+		return {
+			"available": False,
+			"reason": "invalid",
+			"message": frappe._("El Workspace ID debe tener entre 1 y 30 caracteres."),
+			"workspace_id": workspace_id,
+		}
+
+	if not re.match(r"^[a-zA-Z0-9\-]+$", workspace_id):
+		return {
+			"available": False,
+			"reason": "invalid",
+			"message": frappe._("El Workspace ID ingresado es inválido. Solo se admiten letras, números y guiones."),
+			"workspace_id": workspace_id,
+		}
+
+	if workspace_id in _get_reserved_subdomains():
+		return {
+			"available": False,
+			"reason": "reserved",
+			"message": frappe._("El Workspace ID ingresado no está permitido."),
+			"workspace_id": workspace_id,
+		}
+
+	if frappe.db.exists("SaaS Tenant Request", {"subdomain": workspace_id}):
+		existing_status = frappe.db.get_value("SaaS Tenant Request", {"subdomain": workspace_id}, "status")
+		if existing_status != "Failed":
+			return {
+				"available": False,
+				"reason": "duplicate",
+				"message": frappe._("El Workspace ID ya está registrado o en proceso de creación."),
+				"workspace_id": workspace_id,
+			}
+
+	base_domain = get_base_domain()
+	domain = f"{workspace_id}.{base_domain}"
+	if os.path.exists(os.path.join(get_sites_path(), domain)):
+		return {
+			"available": False,
+			"reason": "site_exists",
+			"message": frappe._("El sitio ya existe en el servidor."),
+			"workspace_id": workspace_id,
+		}
+
+	return {
+		"available": True,
+		"reason": "available",
+		"message": frappe._("El Workspace ID está disponible."),
+		"workspace_id": workspace_id,
+	}
 
 
 def _enforce_tenant_request_rate_limit(max_requests=3, window_seconds=900):
@@ -5096,7 +5771,24 @@ def _enforce_tenant_request_rate_limit(max_requests=3, window_seconds=900):
 
 
 @frappe.whitelist(allow_guest=True)
-def request_tenant(subdomain=None, company_name=None, admin_email=None, admin_password=None, workspace_id=None):
+def check_tenant_availability(subdomain=None, workspace_id=None):
+	master_site = _get_primary_master_site()
+	with SafeSiteContext(master_site):
+		return _tenant_workspace_availability(_resolve_workspace_id(subdomain, workspace_id))
+
+
+@frappe.whitelist(allow_guest=True)
+def request_tenant(
+	subdomain=None,
+	company_name=None,
+	admin_email=None,
+	admin_password=None,
+	workspace_id=None,
+	company_tax_id=None,
+	company_address=None,
+	company_phone=None,
+	company_email=None,
+):
 	master_site = _get_primary_master_site()
 	with SafeSiteContext(master_site):
 		return _request_tenant_impl(
@@ -5105,11 +5797,24 @@ def request_tenant(subdomain=None, company_name=None, admin_email=None, admin_pa
 			admin_email,
 			admin_password,
 			workspace_id=workspace_id,
+			company_tax_id=company_tax_id,
+			company_address=company_address,
+			company_phone=company_phone,
+			company_email=company_email,
 		)
 
 
-def _request_tenant_impl(subdomain, company_name, admin_email, admin_password, workspace_id=None):
-	import os
+def _request_tenant_impl(
+	subdomain,
+	company_name,
+	admin_email,
+	admin_password,
+	workspace_id=None,
+	company_tax_id=None,
+	company_address=None,
+	company_phone=None,
+	company_email=None,
+):
 	import re
 	import secrets
 
@@ -5120,28 +5825,32 @@ def _request_tenant_impl(subdomain, company_name, admin_email, admin_password, w
 			frappe._("El Workspace ID ingresado es inválido. Solo se admiten letras, números y guiones.")
 		)
 
-	_validate_tenant_request_payload(workspace_id, company_name, admin_email, admin_password)
+	validated_payload = _validate_tenant_request_payload(
+		workspace_id,
+		company_name,
+		admin_email,
+		admin_password,
+		company_tax_id,
+		company_address,
+		company_phone,
+		company_email,
+	)
+	availability = _tenant_workspace_availability(workspace_id)
+	if not availability["available"]:
+		frappe.throw(availability["message"])
 	base_domain = get_base_domain()
-	domain = f"{workspace_id}.{base_domain}"
 	status_token = secrets.token_urlsafe(24)
-
-	# Check if request already exists or site exists
-	if frappe.db.exists("SaaS Tenant Request", {"subdomain": workspace_id}):
-		existing_status = frappe.db.get_value("SaaS Tenant Request", {"subdomain": workspace_id}, "status")
-		if existing_status != "Failed":
-			frappe.throw(frappe._("El Workspace ID ya está registrado o en proceso de creación."))
-
-	# Check if a folder already exists under sites/
-	sites_path = get_sites_path()
-	if os.path.exists(os.path.join(sites_path, domain)):
-		frappe.throw(frappe._("El sitio ya existe en el servidor."))
 
 	# Create request
 	if frappe.db.exists("SaaS Tenant Request", {"subdomain": workspace_id}):
 		doc = frappe.get_doc("SaaS Tenant Request", {"subdomain": workspace_id})
-		doc.company_name = company_name
-		doc.admin_email = admin_email
-		doc.admin_password = admin_password
+		doc.company_name = validated_payload["company_name"]
+		doc.admin_email = validated_payload["admin_email"]
+		doc.admin_password = validated_payload["admin_password"]
+		doc.company_tax_id = validated_payload["company_tax_id"]
+		doc.company_address = validated_payload["company_address"]
+		doc.company_phone = validated_payload["company_phone"]
+		doc.company_email = validated_payload["company_email"]
 		doc.status_token = status_token
 		doc.status = "Pending"
 		doc.error_log = ""
@@ -5151,9 +5860,13 @@ def _request_tenant_impl(subdomain, company_name, admin_email, admin_password, w
 			{
 				"doctype": "SaaS Tenant Request",
 				"subdomain": workspace_id,
-				"company_name": company_name,
-				"admin_email": admin_email,
-				"admin_password": admin_password,
+				"company_name": validated_payload["company_name"],
+				"admin_email": validated_payload["admin_email"],
+				"admin_password": validated_payload["admin_password"],
+				"company_tax_id": validated_payload["company_tax_id"],
+				"company_address": validated_payload["company_address"],
+				"company_phone": validated_payload["company_phone"],
+				"company_email": validated_payload["company_email"],
 				"status_token": status_token,
 				"status": "Pending",
 			}
@@ -5234,14 +5947,23 @@ def _get_tenant_status_impl(subdomain, token=None, workspace_id=None):
 						response.update({
 							"phase": "configuring_identity",
 							"progress": 80,
-							"message": frappe._("Configurando identidad, compañía y sucursales..."),
+							"message": frappe._("Configurando identidad y datos requeridos del tenant..."),
 						})
 					else:
-						response.update({
-							"phase": "configuring_identity",
-							"progress": 85,
-							"message": frappe._("Configurando identidad, compañía y sucursales..."),
-						})
+						try:
+							validate_tenant_runtime_config()
+						except frappe.ValidationError as ex:
+							response.update({
+								"phase": "configuring_runtime",
+								"progress": 90,
+								"message": str(ex),
+							})
+						else:
+							response.update({
+								"phase": "configuring_runtime",
+								"progress": 95,
+								"message": frappe._("Validando la configuración requerida del tenant..."),
+							})
 			except Exception:
 				response.update({
 					"phase": "installing_apps",
@@ -5254,14 +5976,174 @@ def _get_tenant_status_impl(subdomain, token=None, workspace_id=None):
 	return response
 
 
+def _first_record_name(records):
+	if not records:
+		return ""
+
+	first_record = records[0]
+	if isinstance(first_record, dict):
+		return (first_record.get("name") or "").strip()
+	return (getattr(first_record, "name", "") or "").strip()
+
+
+def _discover_tenant_runtime_defaults(company_name):
+	company_name = (company_name or "").strip()
+	if not company_name:
+		frappe.throw(frappe._("La compañía del tenant no está definida."), frappe.ValidationError)
+
+	try:
+		company = frappe.get_cached_doc("Company", company_name)
+	except Exception:
+		frappe.throw(
+			frappe._("La compañía {0} no existe o no puede leerse.").format(company_name),
+			frappe.ValidationError,
+		)
+
+	company_abbr = (company.abbr or "").strip()
+	if not company_abbr:
+		frappe.throw(
+			frappe._("La compañía {0} no tiene abreviatura configurada.").format(company_name),
+			frappe.ValidationError,
+		)
+
+	runtime_defaults = {
+		"company_name": company_name,
+		"company_abbr": company_abbr,
+		"custom_country": (company.get("country") or "Mexico").strip() or "Mexico",
+		"custom_currency": (company.get("default_currency") or "MXN").strip() or "MXN",
+	}
+
+	warehouse_name = _first_record_name(
+		frappe.get_all(
+			"Warehouse",
+			filters={"company": company_name, "is_group": 0, "disabled": 0},
+			fields=["name"],
+			order_by="creation asc",
+			limit=1,
+		)
+	)
+	cash_account_name = _first_record_name(
+		frappe.get_all(
+			"Account",
+			filters={"company": company_name, "is_group": 0, "disabled": 0, "account_type": "Cash"},
+			fields=["name"],
+			order_by="creation asc",
+			limit=1,
+		)
+	)
+	bank_account_name = _first_record_name(
+		frappe.get_all(
+			"Account",
+			filters={"company": company_name, "is_group": 0, "disabled": 0, "account_type": "Bank"},
+			fields=["name"],
+			order_by="creation asc",
+			limit=1,
+		)
+	)
+
+	missing_links = []
+	if not warehouse_name:
+		missing_links.append(frappe._("Warehouse"))
+	if not cash_account_name:
+		missing_links.append(frappe._("Cash Account"))
+	if not bank_account_name:
+		missing_links.append(frappe._("Bank Account"))
+
+	if missing_links:
+		frappe.throw(
+			frappe._("No se pudo completar el tenant porque faltan enlaces runtime válidos: {0}.").format(
+				", ".join(missing_links)
+			),
+			frappe.ValidationError,
+		)
+
+	runtime_defaults.update(
+		{
+			"default_distribution_warehouse": warehouse_name,
+			"default_cash_account": cash_account_name,
+			"default_bank_account": bank_account_name,
+		}
+	)
+	return runtime_defaults
+
+
+def validate_tenant_runtime_config(config=None):
+	try:
+		config = config or frappe.get_cached_doc("SaaS Feature Config")
+	except Exception:
+		frappe.throw(
+			frappe._("No se pudo leer la configuración runtime del tenant. Reintentá el aprovisionamiento."),
+			frappe.ValidationError,
+		)
+
+	company_name = (config.get("company_name") or "").strip()
+	if not company_name:
+		frappe.throw(
+			frappe._("La configuración runtime todavía no tiene una compañía definida."),
+			frappe.ValidationError,
+		)
+
+	company = _discover_tenant_runtime_defaults(company_name)
+	current_links = {
+		"default_distribution_warehouse": (config.get("default_distribution_warehouse") or "").strip(),
+		"default_cash_account": (config.get("default_cash_account") or "").strip(),
+		"default_bank_account": (config.get("default_bank_account") or "").strip(),
+	}
+
+	missing_links = []
+	if current_links["default_distribution_warehouse"]:
+		if not frappe.get_all(
+			"Warehouse",
+			filters={
+				"name": current_links["default_distribution_warehouse"],
+				"company": company_name,
+				"disabled": 0,
+			},
+			fields=["name"],
+			limit=1,
+		):
+			missing_links.append(frappe._("Warehouse"))
+	else:
+		missing_links.append(frappe._("Warehouse"))
+
+	for account_field, label in [
+		("default_cash_account", frappe._("Cash Account")),
+		("default_bank_account", frappe._("Bank Account")),
+	]:
+		link_name = current_links[account_field]
+		if not link_name:
+			missing_links.append(label)
+			continue
+		if not frappe.get_all(
+			"Account",
+			filters={"name": link_name, "company": company_name, "disabled": 0},
+			fields=["name"],
+			limit=1,
+		):
+			missing_links.append(label)
+
+	if missing_links:
+		frappe.throw(
+			frappe._("La configuración runtime todavía no está completa: {0}.").format(", ".join(missing_links)),
+			frappe.ValidationError,
+		)
+
+	return {
+		"company_name": company_name,
+		"company_abbr": company["company_abbr"],
+		"default_distribution_warehouse": current_links["default_distribution_warehouse"],
+		"default_cash_account": current_links["default_cash_account"],
+		"default_bank_account": current_links["default_bank_account"],
+		"custom_country": (config.get("custom_country") or "").strip() or company["custom_country"],
+		"custom_currency": (config.get("custom_currency") or "").strip() or company["custom_currency"],
+	}
+
+
 def provision_tenant_task(request_id, base_domain="localhost"):
 	import json
 	import os
 	import subprocess
 	import traceback
-
-	# Save the master site name to switch back to it later
-	master_site = frappe.local.site
 
 	doc = frappe.get_doc("SaaS Tenant Request", request_id)
 	doc.status = "In Progress"
@@ -5269,7 +6151,11 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 	frappe.db.commit()
 
 	raw_password = doc.get_password("admin_password")
-	domain = f"{doc.subdomain}.{base_domain}"
+	subdomain = doc.subdomain
+	company_name = doc.company_name
+	admin_email = doc.admin_email
+
+	domain = f"{subdomain}.{base_domain}"
 	bench_path = get_bench_path()
 
 	try:
@@ -5313,14 +6199,8 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 				config_data = json.load(f)
 				db_name = config_data.get("db_name", "")
 
-		# Clear existing context/connection first!
-		frappe.destroy()
-
-		# Connect to the new site and run initialization scripts
-		frappe.init(site=domain, sites_path=get_sites_path())
-		frappe.connect()
-		frappe.set_user("Administrator")
-		try:
+		with SafeSiteContext(domain):
+			frappe.set_user("Administrator")
 			# 1. Bypass setup wizard
 			frappe.db.set_default("desktop:home_page", "Workspace")
 			frappe.db.set_single_value(
@@ -5334,23 +6214,24 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 			)
 
 			install_erpnext_fixtures(country="Mexico")
+			setup_saas_role_permissions()
 
 			# 2. Create Company
-			if not frappe.db.exists("Company", doc.company_name):
+			if not frappe.db.exists("Company", company_name):
 				company = frappe.new_doc("Company")
-				company.company_name = doc.company_name
-				company.abbr = "".join([w[0].upper() for w in doc.company_name.split() if w])[:5] or "COMP"
+				company.company_name = company_name
+				company.abbr = "".join([w[0].upper() for w in company_name.split() if w])[:5] or "COMP"
 				company.default_currency = "MXN"
 				company.country = "Mexico"
 				company.create_chart_of_accounts_based_on = "Standard Template"
 				company.chart_of_accounts = "Mexico - Plan de Cuentas"
 				company.insert(ignore_permissions=True)
-				frappe.db.set_default("company", doc.company_name)
+				frappe.db.set_default("company", company_name)
 
 			# 3. Create / update Admin User
-			if not frappe.db.exists("User", doc.admin_email):
+			if not frappe.db.exists("User", admin_email):
 				user = frappe.new_doc("User")
-				user.email = doc.admin_email
+				user.email = admin_email
 				user.first_name = "Administrador"
 				user.send_welcome_email = 0
 				user.insert(ignore_permissions=True)
@@ -5359,23 +6240,38 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 			# Set/update password bypassing the password strength test
 			from frappe.utils.password import update_password
 
-			update_password(doc.admin_email, raw_password)
+			update_password(admin_email, raw_password)
 
 			# 4. Generate keys
 			from frappe.core.doctype.user.user import generate_keys
 
-			generate_keys(doc.admin_email)
+			generate_keys(admin_email)
+
+			runtime_defaults = _discover_tenant_runtime_defaults(company_name)
+			config = frappe.get_doc("SaaS Feature Config")
+			config.company_name = runtime_defaults["company_name"]
+			config.company_abbr = runtime_defaults["company_abbr"]
+			config.company_tax_id = doc.company_tax_id
+			config.company_address = doc.company_address
+			config.company_phone = doc.company_phone
+			config.company_email = doc.company_email
+			config.default_distribution_warehouse = runtime_defaults["default_distribution_warehouse"]
+			config.default_cash_account = runtime_defaults["default_cash_account"]
+			config.default_bank_account = runtime_defaults["default_bank_account"]
+			config.custom_country = runtime_defaults["custom_country"]
+			config.custom_currency = runtime_defaults["custom_currency"]
+			config.is_active = 1
+			config.max_branches = int(getattr(doc, "max_branches", 0) or config.get("max_branches") or 3)
+			config.print_logo = 1
+			config.print_tax_id = 1
+			config.print_address = 1
+			config.print_contact = 1
+			config.ticket_header = config.get("ticket_header") or ""
+			config.ticket_footer = config.get("ticket_footer") or ""
+			config.save(ignore_permissions=True)
+			validate_tenant_runtime_config(config)
 
 			frappe.db.commit()
-		finally:
-			frappe.destroy()
-
-		# Clear new site context first!
-		frappe.destroy()
-
-		# Re-connect to master site to update status
-		frappe.init(site=master_site, sites_path=get_sites_path())
-		frappe.connect()
 
 		doc = frappe.get_doc("SaaS Tenant Request", request_id)
 		doc.status = "Completed"
@@ -5385,14 +6281,6 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 
 	except Exception as e:
 		err_msg = f"Error: {e!s}\n\nTraceback:\n{traceback.format_exc()}"
-
-		# Ensure we are connected back to the master site
-		try:
-			frappe.destroy()
-			frappe.init(site=master_site, sites_path=get_sites_path())
-			frappe.connect()
-		except Exception:
-			pass
 
 		try:
 			doc = frappe.get_doc("SaaS Tenant Request", request_id)
@@ -5481,9 +6369,24 @@ def _populate_platform_dashboard_metrics(tenant, site_name):
 	tenant.setdefault("active_modules", {})
 
 	try:
-		profiles = frappe.get_all("POS Profile", fields=["name", "warehouse", "disabled"])
-		tenant["branch_count"] = len([p for p in profiles if not p.disabled])
-		tenant["branches"] = [{"name": p.name, "warehouse": p.warehouse, "disabled": p.disabled} for p in profiles]
+		config = frappe.get_cached_doc("SaaS Feature Config")
+		pos_enabled = bool(config.has_pos)
+		tenant["active_modules"] = {
+			"pos": pos_enabled,
+			"production": bool(config.has_production),
+			"logistics": bool(config.has_logistics),
+			"wholesale": bool(config.get("has_wholesale", 1)),
+			"services": bool(config.get("has_services") if config.get("has_services") is not None else 1),
+			"products": bool(config.get("has_products") if config.get("has_products") is not None else 1),
+			"purchasing": bool(config.get("has_purchasing", 0)),
+		}
+
+		if pos_enabled:
+			profiles = frappe.get_all("POS Profile", fields=["name", "warehouse", "disabled"])
+			tenant["branch_count"] = len([p for p in profiles if not p.disabled])
+			tenant["branches"] = [
+				{"name": p.name, "warehouse": p.warehouse, "disabled": p.disabled} for p in profiles
+			]
 
 		try:
 			tenant["users_count"] = frappe.db.count(
@@ -5516,20 +6419,6 @@ def _populate_platform_dashboard_metrics(tenant, site_name):
 			tenant["last_sale_date"] = frappe.db.get_value(
 				"Sales Invoice", {"docstatus": 1}, "posting_date", order_by="posting_date desc"
 			)
-		except Exception:
-			pass
-
-		try:
-			config = frappe.get_cached_doc("SaaS Feature Config")
-			tenant["active_modules"] = {
-				"pos": bool(config.has_pos),
-				"production": bool(config.has_production),
-				"logistics": bool(config.has_logistics),
-				"wholesale": bool(config.get("has_wholesale", 1)),
-				"services": bool(config.get("has_services") if config.get("has_services") is not None else 1),
-				"products": bool(config.get("has_products") if config.get("has_products") is not None else 1),
-				"purchasing": bool(config.get("has_purchasing", 0)),
-			}
 		except Exception:
 			pass
 	except Exception as ex:
@@ -5864,15 +6753,24 @@ def toggle_tenant_branch(subdomain, branch_name, disabled):
 
 
 def validate_tenant_is_active():
-	if _is_platform_master_site():
-		return
-
-	cmd = frappe.local.form_dict.get("cmd")
+	form_dict = getattr(frappe.local, "form_dict", None) or {}
+	cmd = form_dict.get("cmd")
+	if not cmd:
+		request = getattr(frappe.local, "request", None)
+		path = getattr(request, "path", "") or ""
+		if path.startswith("/api/method/"):
+			cmd = path.removeprefix("/api/method/")
 	if cmd in [
 		"paletixa_saas.paletixa_saas.api.get_features",
+		"paletixa_saas.paletixa_saas.api.check_tenant_availability",
+		"paletixa_saas.paletixa_saas.api.request_tenant",
+		"paletixa_saas.paletixa_saas.api.get_tenant_status",
 		"logout",
 		"paletixa_saas.paletixa_saas.api.custom_logout",
 	]:
+		return
+
+	if _safe_is_platform_master_site():
 		return
 
 	try:

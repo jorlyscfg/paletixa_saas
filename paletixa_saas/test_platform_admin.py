@@ -588,3 +588,119 @@ def test_get_platform_admin_dashboard_falls_back_to_site_directory_when_requests
         frappe.get_cached_doc = original_get_cached_doc
         saas_api.SafeSiteContext = original_safe_context
         saas_api._is_platform_master_site = original_is_master_site
+
+
+def test_get_platform_admin_dashboard_skips_pos_profile_reads_when_pos_is_disabled(monkeypatch, tmp_path):
+    sites_path = tmp_path / "sites"
+    sites_path.mkdir()
+
+    tenant_site = "tenant-no-pos.localhost"
+    master_site = "frontend"
+    (sites_path / tenant_site).mkdir()
+
+    class _FakeConfig:
+        def __init__(self):
+            self.has_pos = 0
+            self.has_production = 0
+            self.has_logistics = 0
+            self.has_wholesale = 1
+            self.has_services = 1
+            self.has_products = 1
+            self.has_purchasing = 0
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    class _FakeSafeSiteContext:
+        def __init__(self, site):
+            self.site = site
+            self.previous_site = None
+
+        def __enter__(self):
+            self.previous_site = getattr(frappe.local, "site", None)
+            frappe.local.site = self.site
+            return frappe
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            frappe.local.site = self.previous_site
+
+    original_user = frappe.session.user
+    original_site = getattr(frappe.local, "site", None)
+    original_get_roles = frappe.get_roles
+    original_get_all = frappe.get_all
+    original_db_count = frappe.db.count
+    original_db_get_value = frappe.db.get_value
+    original_get_cached_doc = frappe.get_cached_doc
+    original_safe_context = saas_api.SafeSiteContext
+    original_is_master_site = saas_api._is_platform_master_site
+
+    def _fake_get_all(doctype, filters=None, fields=None, order_by=None, limit=None):
+        if doctype == "SaaS Tenant Request":
+            return [
+                frappe._dict(
+                    name="tenant-no-pos",
+                    company_name="Tenant No POS",
+                    admin_email="admin@tenant.test",
+                    active=1,
+                    max_branches=3,
+                    creation=None,
+                    database_name="tenant_no_pos_db",
+                    exempt_from_payment=0,
+                    last_payment_date=None,
+                    expiration_date=None,
+                    site_name=tenant_site,
+                )
+            ]
+        if doctype == "POS Profile":
+            raise AssertionError("POS Profile should not be queried when POS is disabled")
+        return []
+
+    def _fake_db_count(doctype, filters=None):
+        if doctype == "User":
+            return 2
+        if doctype == "Customer":
+            return 5
+        return 0
+
+    def _fake_db_get_value(doctype, filters=None, fieldname=None, **kwargs):
+        if doctype == "Sales Invoice" and fieldname == "sum(grand_total)":
+            return 99.5
+        if doctype == "Sales Invoice" and fieldname == "posting_date":
+            return "2026-06-19"
+        return None
+
+    try:
+        frappe.session.user = "Administrator"
+        frappe.local.site = master_site
+        frappe.get_roles = lambda user=None: ["System Manager"] if (user or frappe.session.user) != "Guest" else []
+        frappe.get_all = _fake_get_all
+        frappe.db.count = _fake_db_count
+        frappe.db.get_value = _fake_db_get_value
+        frappe.get_cached_doc = lambda doctype, name=None: _FakeConfig() if doctype == "SaaS Feature Config" else None
+        saas_api.SafeSiteContext = _FakeSafeSiteContext
+        saas_api._is_platform_master_site = lambda site=None: True
+        saas_api.get_bench_path = lambda: str(tmp_path)
+        saas_api.get_sites_path = lambda: str(sites_path)
+
+        tenants = get_platform_admin_dashboard()
+
+        assert len(tenants) == 1
+        tenant = tenants[0]
+        assert tenant["name"] == "tenant-no-pos"
+        assert tenant["branch_count"] == 0
+        assert tenant["branches"] == []
+        assert tenant["active_modules"]["pos"] is False
+        assert tenant["users_count"] == 2
+        assert tenant["customers_count"] == 5
+        assert tenant["sales_30_days"] == 99.5
+        assert tenant["last_sale_date"] == "2026-06-19"
+    finally:
+        frappe.session.user = original_user
+        frappe.local.site = original_site
+        frappe.get_roles = original_get_roles
+        frappe.get_all = original_get_all
+        frappe.db.count = original_db_count
+        frappe.db.get_value = original_db_get_value
+        frappe.get_cached_doc = original_get_cached_doc
+        saas_api.SafeSiteContext = original_safe_context
+        saas_api._is_platform_master_site = original_is_master_site
