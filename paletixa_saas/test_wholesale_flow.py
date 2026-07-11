@@ -259,8 +259,10 @@ def run_tests():
 		create_event_booking,
 		get_event_warehouses,
 		get_pending_event_bookings,
+		release_event_booking,
 		update_saas_config,
 	)
+	from paletixa_saas.paletixa_saas.event_reservation_service import build_active_capacity_key
 
 	try:
 		frappe.clear_cache()
@@ -288,28 +290,28 @@ def run_tests():
 			payment_ids = [p.parent for p in payments]
 			if payment_ids:
 				frappe.db.sql(
-					"DELETE FROM `tabPayment Entry Reference` WHERE parent IN (%s)"
-					% ", ".join(["'%s'" % p for p in payment_ids])
+					"DELETE FROM `tabPayment Entry Reference` WHERE parent IN %s",
+					(tuple(payment_ids),),
 				)
 				frappe.db.sql(
-					"DELETE FROM `tabPayment Entry` WHERE name IN (%s)"
-					% ", ".join(["'%s'" % p for p in payment_ids])
+					"DELETE FROM `tabPayment Entry` WHERE name IN %s",
+					(tuple(payment_ids),),
 				)
 
 			# Eliminar entradas de libro de anticipos (Advance Payment Ledger Entry)
 			frappe.db.sql(
-				"DELETE FROM `tabAdvance Payment Ledger Entry` WHERE against_voucher_no IN (%s)"
-				% ", ".join(["'%s'" % o for o in orders_to_delete])
+				"DELETE FROM `tabAdvance Payment Ledger Entry` WHERE against_voucher_no IN %s",
+				(tuple(orders_to_delete),),
 			)
 
 			# Eliminar ítems y cabecera del Sales Order
 			frappe.db.sql(
-				"DELETE FROM `tabSales Order Item` WHERE parent IN (%s)"
-				% ", ".join(["'%s'" % o for o in orders_to_delete])
+				"DELETE FROM `tabSales Order Item` WHERE parent IN %s",
+				(tuple(orders_to_delete),),
 			)
 			frappe.db.sql(
-				"DELETE FROM `tabSales Order` WHERE name IN (%s)"
-				% ", ".join(["'%s'" % o for o in orders_to_delete])
+				"DELETE FROM `tabSales Order` WHERE name IN %s",
+				(tuple(orders_to_delete),),
 			)
 
 		frappe.db.commit()
@@ -358,32 +360,78 @@ def run_tests():
 			guest_phone="+525512345678",
 		)
 
-		if not booking_res.get("success"):
-			print("❌ Falla: No se pudo registrar la reserva de evento.")
-			return
+		assert booking_res.get("success"), "No se pudo registrar la reserva de evento."
 
 		booking_id = booking_res.get("sales_order")
+		reservation_id = booking_res.get("reservation")
+		assert booking_id, "La API de reserva no devolvió el identificador del Sales Order."
+		assert reservation_id, "La API de reserva no devolvió el identificador de Event Cart Reservation."
+		assert reservation_id == booking_id, (
+			"La reserva persistida debe compartir el mismo nombre que el Sales Order."
+		)
+		assert booking_res.get("reservation_state") == "Pending Confirmation"
+		assert float(booking_res.get("advance_paid") or 0.0) == 500.0, (
+			"El anticipo devuelto por la API debe coincidir con el monto solicitado en la prueba."
+		)
 		print(f"✅ Éxito: Reserva de Evento '{booking_id}' creada correctamente.")
 		print(f"   Anticipo registrado: ${booking_res.get('advance_paid')}")
 
+		reservation_doc = frappe.get_doc("Event Cart Reservation", reservation_id)
+		expected_outstanding = max(0.0, float(reservation_doc.grand_total or 0.0) - 500.0)
+		expected_customer = frappe.db.get_value(
+			"Customer", {"mobile_no": "+525512345678"}, "name"
+		) or frappe.db.get_value("Customer", {"customer_name": "Reserva Pruebas Evento"}, "name")
+		assert expected_customer, "No se pudo resolver el Customer persistido para la reserva."
+		assert reservation_doc.sales_order == booking_id
+		assert reservation_doc.customer == expected_customer
+		assert reservation_doc.event_date == booking_date
+		assert reservation_doc.company == get_platform_company_name()
+		assert reservation_doc.state == "Pending Confirmation"
+		assert reservation_doc.payment_entry, (
+			"La reserva persistida debe registrar el Payment Entry del anticipo."
+		)
+		assert float(reservation_doc.advance_paid or 0.0) == 500.0, (
+			"La reserva persistida debe registrar el anticipo exacto de la prueba."
+		)
+		assert float(reservation_doc.outstanding_amount or 0.0) == expected_outstanding, (
+			"El saldo pendiente persistido no coincide con el total menos el anticipo."
+		)
+		assert not reservation_doc.assigned_cart_warehouse
+		assert reservation_doc.capacity_slot, "La reserva pendiente debe asignar un capacity slot."
+		assert reservation_doc.active_capacity_key == build_active_capacity_key(
+			booking_date,
+			reservation_doc.capacity_slot,
+			reservation_doc.company,
+		)
+		assert reservation_doc.items, "La reserva debe persistir los ítems vinculados al pedido."
+		assert len(reservation_doc.items) == len(event_items) + 1
+		reservation_asset_rows = [
+			row for row in reservation_doc.items if row.item_code == reservation_doc.reservation_item_code
+		]
+		assert len(reservation_asset_rows) == 1, (
+			"Debe existir exactamente un ítem marcado como activo de reserva."
+		)
+		assert reservation_asset_rows[0].is_reservation_asset == 1
+		assert reservation_asset_rows[0].sales_order_item
+		assert all(
+			row.is_reservation_asset == 0
+			for row in reservation_doc.items
+			if row.item_code != reservation_doc.reservation_item_code
+		)
+
 		# Verificar reducción de disponibilidad del Carrito Paletero
 		avail_after = check_cart_availability(booking_date)
-		if avail_after.get("available_qty") == initial_available - 1:
-			print("✅ Éxito: Disponibilidad de Carritos disminuyó a exactamente 1 unidad libre.")
-		else:
-			print(
-				f"❌ Falla: La disponibilidad de carritos no cambió correctamente. Antes: {initial_available}, Después: {avail_after.get('available_qty')}"
-			)
+		assert avail_after.get("available_qty") == initial_available - 1, (
+			"La disponibilidad de carritos no cambió correctamente. "
+			f"Antes: {initial_available}, Después: {avail_after.get('available_qty')}"
+		)
 
 		# 4d. Listar reservas pendientes en el panel
 		print("   Listando reservas de eventos pendientes para el administrador...")
 		pending_bookings = get_pending_event_bookings()
 		pending_names = [pb.name for pb in pending_bookings]
-		if booking_id in pending_names:
-			print(f"✅ Éxito: La reserva '{booking_id}' figura en la cola del nuevo panel administrativo.")
-		else:
-			print(f"❌ Falla: La reserva '{booking_id}' NO figura en el listado del panel.")
-			return
+		assert booking_id in pending_names, f"La reserva '{booking_id}' NO figura en el listado del panel."
+		print(f"✅ Éxito: La reserva '{booking_id}' figura en la cola del nuevo panel administrativo.")
 
 		# 4e. Obtener almacenes de Carritos disponibles
 		print("   Obteniendo almacenes de Carritos sincronizados para imputar el stock...")
@@ -414,8 +462,8 @@ def run_tests():
 		se_wh.insert(ignore_permissions=True)
 		se_wh.submit()
 
-		# 4f. Completar y facturar la reserva imputando stock al almacén seleccionado
-		print("   Completando y facturando la reserva imputando stock...")
+		# 4f. Completar y facturar la reserva sin consumir stock
+		print("   Completando y facturando la reserva sin consumir stock...")
 		stock_before_completion = (
 			frappe.db.get_value(
 				"Bin", {"item_code": test_item_code, "warehouse": target_carrito_wh}, "actual_qty"
@@ -436,21 +484,41 @@ def run_tests():
 				f"   Factura: {completion_res['sales_invoice']} | Saldo Cobrado: ${completion_res['advance_paid']} | Outstanding: ${completion_res['outstanding_amount']}"
 			)
 
-			# Verificar reducción de stock en el almacén seleccionado
+			# Verificar que la confirmación no consuma stock
 			stock_after_completion = (
 				frappe.db.get_value(
 					"Bin", {"item_code": test_item_code, "warehouse": target_carrito_wh}, "actual_qty"
 				)
 				or 0.0
 			)
-			if float(stock_after_completion) == float(stock_before_completion) - 120.0:
-				print(
-					f"✅ Éxito: El stock físico en '{target_carrito_wh}' disminuyó exactamente 120 unidades tras facturar el evento."
-				)
+			if float(stock_after_completion) == float(stock_before_completion):
+				print(f"✅ Éxito: La confirmación no consumió stock en '{target_carrito_wh}'.")
 			else:
 				print(
-					f"❌ Falla: El stock no disminuyó en el almacén elegido. Antes: {stock_before_completion}, Después: {stock_after_completion}"
+					f"❌ Falla: La confirmación cambió el stock del almacén elegido. Antes: {stock_before_completion}, Después: {stock_after_completion}"
 				)
+
+			# Liberar la reserva al finalizar el evento
+			release_res = release_event_booking(
+				sales_order_name=booking_id, release_notes="Liberación posterior al evento"
+			)
+			if release_res.get("success"):
+				print("✅ Éxito: Reserva liberada correctamente después del evento.")
+
+				stock_after_release = (
+					frappe.db.get_value(
+						"Bin", {"item_code": test_item_code, "warehouse": target_carrito_wh}, "actual_qty"
+					)
+					or 0.0
+				)
+				if float(stock_after_release) == float(stock_before_completion) - 120.0:
+					print(
+						f"✅ Éxito: El stock físico en '{target_carrito_wh}' disminuyó exactamente 120 unidades al liberar el evento."
+					)
+				else:
+					print(
+						f"❌ Falla: El stock no disminuyó al liberar el evento. Antes: {stock_before_completion}, Después: {stock_after_release}"
+					)
 		else:
 			print("❌ Falla: complete_event_booking falló sin lanzar excepciones.")
 
@@ -645,6 +713,7 @@ def run_tests():
 		import traceback
 
 		traceback.print_exc()
+		raise
 	finally:
 		frappe.db.rollback()
 		frappe.destroy()

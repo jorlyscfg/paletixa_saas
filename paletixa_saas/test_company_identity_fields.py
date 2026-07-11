@@ -54,7 +54,10 @@ def test_setup_company_identity_fields_adds_warehouse_options():
 
 	try:
 		frappe.local.site = "test.localhost"
-		frappe.db.exists = lambda doctype, name=None: doctype == "Custom Field" and name != "SaaS Feature Config-default_distribution_warehouse"
+		frappe.db.exists = (
+			lambda doctype, name=None: doctype == "Custom Field"
+			and name != "SaaS Feature Config-default_distribution_warehouse"
+		)
 		frappe.get_doc = lambda payload: created_docs.append(payload) or _FakeDoc(payload)
 		frappe.get_meta = lambda doctype: _FakeMeta()
 		frappe.cache = lambda: fake_cache

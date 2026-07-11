@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
-
-from pathlib import Path
 import tempfile
 import uuid
+from pathlib import Path
 
 import frappe
 import pytest

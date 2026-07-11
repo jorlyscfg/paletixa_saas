@@ -1,0 +1,263 @@
+{
+  "actions": [],
+  "autoname": "field:sales_order",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "is_submittable": 0,
+  "issingle": 0,
+  "name": "Event Cart Reservation",
+  "module": "Paletixa SaaS",
+  "owner": "Administrator",
+  "editable_grid": 1,
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "title_field": "sales_order",
+  "search_fields": "sales_order,customer,event_date,assigned_cart_warehouse",
+  "fields": [
+    {
+      "fieldname": "reservation_details_section",
+      "fieldtype": "Section Break",
+      "label": "Reservation Details"
+    },
+    {
+      "fieldname": "sales_order",
+      "fieldtype": "Link",
+      "label": "Sales Order",
+      "options": "Sales Order",
+      "reqd": 1,
+      "unique": 1
+    },
+    {
+      "fieldname": "customer",
+      "fieldtype": "Link",
+      "label": "Customer",
+      "options": "Customer",
+      "reqd": 1
+    },
+    {
+      "fieldname": "event_date",
+      "fieldtype": "Date",
+      "label": "Event Date",
+      "reqd": 1
+    },
+    {
+      "fieldname": "company",
+      "fieldtype": "Link",
+      "label": "Company",
+      "options": "Company",
+      "reqd": 1
+    },
+    {
+      "fieldname": "reservation_item_code",
+      "fieldtype": "Link",
+      "label": "Reservation Item Code",
+      "options": "Item",
+      "reqd": 1
+    },
+    {
+      "fieldname": "state",
+      "fieldtype": "Select",
+      "label": "State",
+      "options": "Pending Confirmation\nConfirmed\nCancelled\nReleased",
+      "default": "Pending Confirmation",
+      "reqd": 1
+    },
+    {
+      "fieldname": "allocation_section",
+      "fieldtype": "Section Break",
+      "label": "Allocation"
+    },
+    {
+      "fieldname": "assigned_cart_warehouse",
+      "fieldtype": "Link",
+      "label": "Assigned Cart Warehouse",
+      "options": "Warehouse"
+    },
+    {
+      "fieldname": "capacity_slot",
+      "fieldtype": "Int",
+      "label": "Capacity Slot",
+      "hidden": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "active_allocation_key",
+      "fieldtype": "Data",
+      "label": "Active Allocation Key",
+      "hidden": 1,
+      "read_only": 1,
+      "unique": 1
+    },
+    {
+      "fieldname": "active_capacity_key",
+      "fieldtype": "Data",
+      "label": "Active Capacity Key",
+      "hidden": 1,
+      "read_only": 1,
+      "unique": 1
+    },
+    {
+      "fieldname": "linked_documents_section",
+      "fieldtype": "Section Break",
+      "label": "Linked Documents"
+    },
+    {
+      "fieldname": "sales_invoice",
+      "fieldtype": "Link",
+      "label": "Sales Invoice",
+      "options": "Sales Invoice"
+    },
+    {
+      "fieldname": "payment_entry",
+      "fieldtype": "Link",
+      "label": "Payment Entry",
+      "options": "Payment Entry"
+    },
+    {
+      "fieldname": "credit_note",
+      "fieldtype": "Link",
+      "label": "Credit Note",
+      "options": "Sales Invoice"
+    },
+    {
+      "fieldname": "refund_payment_entry",
+      "fieldtype": "Link",
+      "label": "Refund Payment Entry",
+      "options": "Payment Entry"
+    },
+    {
+      "fieldname": "delivery_note",
+      "fieldtype": "Link",
+      "label": "Delivery Note",
+      "options": "Delivery Note"
+    },
+    {
+      "fieldname": "financial_snapshot_section",
+      "fieldtype": "Section Break",
+      "label": "Financial Snapshot"
+    },
+    {
+      "fieldname": "grand_total",
+      "fieldtype": "Currency",
+      "label": "Grand Total",
+      "default": 0
+    },
+    {
+      "fieldname": "base_grand_total",
+      "fieldtype": "Currency",
+      "label": "Base Grand Total",
+      "default": 0
+    },
+    {
+      "fieldname": "advance_paid",
+      "fieldtype": "Currency",
+      "label": "Advance Paid",
+      "default": 0
+    },
+    {
+      "fieldname": "outstanding_amount",
+      "fieldtype": "Currency",
+      "label": "Outstanding Amount",
+      "default": 0
+    },
+    {
+      "fieldname": "credit_note_amount",
+      "fieldtype": "Currency",
+      "label": "Credit Note Amount",
+      "default": 0
+    },
+    {
+      "fieldname": "refund_amount",
+      "fieldtype": "Currency",
+      "label": "Refund Amount",
+      "default": 0
+    },
+    {
+      "fieldname": "lifecycle_notes_section",
+      "fieldtype": "Section Break",
+      "label": "Lifecycle Notes"
+    },
+    {
+      "fieldname": "cancel_reason",
+      "fieldtype": "Small Text",
+      "label": "Cancel Reason"
+    },
+    {
+      "fieldname": "cancelled_at",
+      "fieldtype": "Datetime",
+      "label": "Cancelled At"
+    },
+    {
+      "fieldname": "cancelled_by",
+      "fieldtype": "Link",
+      "label": "Cancelled By",
+      "options": "User"
+    },
+    {
+      "fieldname": "release_notes",
+      "fieldtype": "Small Text",
+      "label": "Release Notes"
+    },
+    {
+      "fieldname": "released_at",
+      "fieldtype": "Datetime",
+      "label": "Released At"
+    },
+    {
+      "fieldname": "released_by",
+      "fieldtype": "Link",
+      "label": "Released By",
+      "options": "User"
+    },
+    {
+      "fieldname": "confirmed_at",
+      "fieldtype": "Datetime",
+      "label": "Confirmed At"
+    },
+    {
+      "fieldname": "confirmed_by",
+      "fieldtype": "Link",
+      "label": "Confirmed By",
+      "options": "User"
+    },
+    {
+      "fieldname": "reconciliation_notes",
+      "fieldtype": "Small Text",
+      "label": "Reconciliation Notes"
+    },
+    {
+      "fieldname": "needs_reconciliation",
+      "fieldtype": "Check",
+      "label": "Needs Reconciliation",
+      "default": 0
+    },
+    {
+      "fieldname": "legacy_consumed",
+      "fieldtype": "Check",
+      "label": "Legacy Consumed",
+      "default": 0
+    },
+    {
+      "fieldname": "items",
+      "fieldtype": "Table",
+      "label": "Reservation Items",
+      "options": "Event Cart Reservation Item"
+    }
+  ],
+  "index_web_pages_for_search": 1,
+  "links": [],
+  "modified": "2026-07-07 00:00:00.000000",
+  "modified_by": "Administrator",
+  "permissions": [
+    {
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 1
+    }
+  ],
+  "states": []
+}

@@ -2,6 +2,7 @@ import json
 import secrets
 import time
 import traceback
+from contextlib import contextmanager
 
 import frappe
 
@@ -21,16 +22,24 @@ from paletixa_saas.config.infrastructure import (
 	get_sites_path as _get_sites_path,
 )
 from paletixa_saas.config.infrastructure import (
-	resolve_platform_master_sites as _resolve_platform_master_sites,
-)
-from paletixa_saas.config.infrastructure import (
 	is_platform_master_site as _is_platform_master_site,
 )
+from paletixa_saas.config.infrastructure import (
+	resolve_platform_master_sites as _resolve_platform_master_sites,
+)
 from paletixa_saas.config.platform_defaults import (
+	_validate_platform_distribution_warehouse,
+	ensure_platform_payment_mode,
 	get_platform_company_abbr,
 	get_platform_company_name,
 	get_platform_distribution_warehouse,
 	get_platform_payment_account,
+)
+from paletixa_saas.paletixa_saas.event_reservation_service import (
+	get_event_reservation_production_demand as _get_event_reservation_production_demand,
+)
+from paletixa_saas.paletixa_saas.event_reservation_service import (
+	validate_confirmed_allocation_warehouse,
 )
 
 
@@ -40,7 +49,11 @@ def is_tenant_admin_user(user=None):
 		return False
 
 	normalized_user = user.lower()
-	return user == "Administrator" or normalized_user.startswith("admin@") or normalized_user.startswith("admin.")
+	return (
+		user == "Administrator"
+		or normalized_user.startswith("admin@")
+		or normalized_user.startswith("admin.")
+	)
 
 
 def is_service_operator_user(user=None):
@@ -441,7 +454,10 @@ def get_features():
 		setup_company_identity_fields()
 		config = frappe.get_cached_doc("SaaS Feature Config")
 		reservations_active = _reservations_are_active(config)
-		return {
+		can_expose_admin_defaults = is_tenant_admin_user() or _is_system_manager()
+		if can_expose_admin_defaults and (config.get("default_distribution_warehouse") or "").strip():
+			_validate_platform_distribution_warehouse(config.get("default_distribution_warehouse"))
+		features_payload = {
 			"client_name": get_platform_company_name(),
 			"colors": {
 				"primary": config.primary_color or "#1abc9c",
@@ -457,9 +473,15 @@ def get_features():
 				"products": bool(config.get("has_products") if config.get("has_products") is not None else 1),
 				"purchasing": bool(config.get("has_purchasing", 0)),
 			},
-			"reservation_item_code": (config.get("reservation_item_code") or "Carrito Paletero") if reservations_active else "",
-			"max_reservation_assets": int(config.get("max_reservation_assets") or 0) if reservations_active else 0,
-			"default_event_items": (config.get("default_event_items") or "[]") if reservations_active else "[]",
+			"reservation_item_code": (config.get("reservation_item_code") or "Carrito Paletero")
+			if reservations_active
+			else "",
+			"max_reservation_assets": int(config.get("max_reservation_assets") or 0)
+			if reservations_active
+			else 0,
+			"default_event_items": (config.get("default_event_items") or "[]")
+			if reservations_active
+			else "[]",
 			"custom_country": config.get("custom_country") or "Mexico",
 			"custom_currency": config.get("custom_currency") or "MXN",
 			# Company identity and ticket runtime defaults
@@ -480,6 +502,11 @@ def get_features():
 				config.get("max_branches", 3) if config.get("max_branches") is not None else 3
 			),
 		}
+		if can_expose_admin_defaults:
+			features_payload["default_distribution_warehouse"] = (
+				config.get("default_distribution_warehouse") or ""
+			)
+		return features_payload
 	except frappe.ValidationError as e:
 		return {
 			"error": str(e),
@@ -809,7 +836,10 @@ def update_saas_config(
 	if company_abbr is not None:
 		config.company_abbr = company_abbr
 	if default_distribution_warehouse is not None:
-		config.default_distribution_warehouse = default_distribution_warehouse
+		config.default_distribution_warehouse = _validate_platform_distribution_warehouse(
+			default_distribution_warehouse,
+			company_name=effective_company_name,
+		)
 	if default_cash_account is not None:
 		config.default_cash_account = default_cash_account
 	if default_bank_account is not None:
@@ -1753,8 +1783,74 @@ def setup_reservation_fields():
 	return {"success": True, "created": created}
 
 
+def _require_event_lifecycle_admin_access():
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if "System Manager" not in frappe.get_roles(frappe.session.user):
+		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
+
+
+def _get_event_reservation(sales_order_name):
+	if not frappe.db.exists("Event Cart Reservation", sales_order_name):
+		frappe.throw(frappe._("La reserva {0} no existe.").format(sales_order_name))
+
+	return frappe.get_doc("Event Cart Reservation", sales_order_name)
+
+
+def _get_active_event_reservation_count(event_date, company=None):
+	company = (company or get_platform_company_name()).strip()
+	filters = {"event_date": event_date, "state": ["in", ["Pending Confirmation", "Confirmed"]]}
+	if company:
+		filters["company"] = company
+
+	return len(frappe.get_all("Event Cart Reservation", filters=filters, fields=["name"]))
+
+
+def _build_event_reservation_items(so, reservation_item_code):
+	items = []
+	for so_item in so.items:
+		items.append(
+			{
+				"item_code": so_item.item_code,
+				"item_name": so_item.item_name,
+				"qty": so_item.qty,
+				"rate": so_item.rate,
+				"amount": so_item.amount,
+				"sales_order_item": so_item.name,
+				"is_reservation_asset": 1 if so_item.item_code == reservation_item_code else 0,
+			}
+		)
+
+	return items
+
+
+def _create_event_reservation_from_sales_order(so, reservation_item_code):
+	reservation = frappe.new_doc("Event Cart Reservation")
+	reservation.sales_order = so.name
+	reservation.customer = so.customer
+	reservation.event_date = so.delivery_date
+	reservation.company = so.company
+	reservation.reservation_item_code = reservation_item_code
+	reservation.state = "Pending Confirmation"
+	reservation.grand_total = float(so.grand_total or 0.0)
+	reservation.base_grand_total = float(
+		getattr(so, "base_grand_total", so.grand_total) or so.grand_total or 0.0
+	)
+	reservation.advance_paid = float(getattr(so, "advance_paid", 0) or 0.0)
+	reservation.outstanding_amount = float(
+		getattr(so, "outstanding_amount", so.grand_total) or so.grand_total or 0.0
+	)
+
+	for item in _build_event_reservation_items(so, reservation_item_code):
+		reservation.append("items", item)
+
+	reservation.insert(ignore_permissions=True)
+	return reservation
+
+
 @frappe.whitelist(allow_guest=True)
-def check_cart_availability(date):
+def check_cart_availability(date, company=None):
 	if not date:
 		frappe.throw(frappe._("Por favor especifique una fecha."))
 
@@ -1763,33 +1859,21 @@ def check_cart_availability(date):
 	has_res = bool(config.get("has_reservations", 0))
 	item_code = config.get("reservation_item_code") or "Carrito Paletero"
 	max_assets = int(config.get("max_reservation_assets") or 10)
+	company = (company or get_platform_company_name()).strip()
 
 	if not has_res:
 		return {"enabled": False, "message": "El módulo de reservas está deshabilitado."}
 
-	# Consultar cantidad reservada en Sales Orders activos para esa fecha
-	orders = frappe.db.sql(
-		"""
-        SELECT SUM(so_item.qty)
-        FROM `tabSales Order` so
-        JOIN `tabSales Order Item` so_item ON so.name = so_item.parent
-        WHERE (so.docstatus = 1 OR (so.docstatus = 0 AND so.advance_paid > 0))
-          AND so.status NOT IN ('Closed', 'Completed', 'Cancelled')
-          AND so.delivery_date = %s
-          AND so_item.item_code = %s
-    """,
-		(date, item_code),
-	)
-
-	already_booked = orders[0][0] or 0
-	available_qty = max(0, max_assets - already_booked)
+	active_reserved = _get_active_event_reservation_count(date, company=company)
+	available_qty = max(0, max_assets - active_reserved)
 
 	return {
 		"enabled": True,
 		"date": date,
 		"item_code": item_code,
 		"max_assets": max_assets,
-		"already_booked": already_booked,
+		"active_reserved": active_reserved,
+		"already_booked": active_reserved,
 		"available_qty": available_qty,
 	}
 
@@ -1825,17 +1909,21 @@ def create_event_booking(
 	if not _reservations_are_active(config):
 		return _reservations_disabled_response()
 
+	company_name = get_platform_company_name()
+
 	if is_guest_request and _event_booking_is_rate_limited(guest_phone, guest_name):
 		return {"success": False, "error": frappe._("No se pudo registrar la reserva de evento.")}
 
-	lock_name = f"event_booking:{delivery_date}"
+	lock_name = f"event_booking:{company_name}:{delivery_date}"
 	lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_name,))
 	lock_acquired = bool(lock_result and lock_result[0][0] == 1)
 	if not lock_acquired:
-		frappe.throw(frappe._("No se pudo asegurar la fecha de reserva. Intentá nuevamente."), frappe.PermissionError)
+		frappe.throw(
+			frappe._("No se pudo asegurar la fecha de reserva. Intentá nuevamente."), frappe.PermissionError
+		)
 
 	try:
-		availability = check_cart_availability(delivery_date)
+		availability = check_cart_availability(delivery_date, company=company_name)
 		if not availability.get("enabled", True):
 			return _reservations_disabled_response()
 		if int(availability.get("available_qty") or 0) <= 0:
@@ -1854,7 +1942,11 @@ def create_event_booking(
 			customer = None
 
 		final_customer = customer
-		if (not is_guest_request) and (not final_customer or final_customer == "Público General") and guest_name:
+		if (
+			(not is_guest_request)
+			and (not final_customer or final_customer == "Público General")
+			and guest_name
+		):
 			# Buscar si ya existe un cliente con ese nombre o teléfono
 			existing = None
 			if guest_phone:
@@ -1879,7 +1971,6 @@ def create_event_booking(
 		if not final_customer:
 			final_customer = "Público General"
 
-		company_name = get_platform_company_name()
 		warehouse = get_platform_distribution_warehouse()
 
 		# 1. Crear el Sales Order nativo
@@ -1905,9 +1996,15 @@ def create_event_booking(
 		for it in parsed_items:
 			item_code_input = it.get("item_code")
 			if item_code_input == item_code:
-				frappe.throw(frappe._("El artículo reservado no puede agregarse dentro de los productos del evento."))
+				frappe.throw(
+					frappe._("El artículo reservado no puede agregarse dentro de los productos del evento.")
+				)
 			if item_code_input not in allowed_item_codes:
-				frappe.throw(frappe._("El producto {0} no está permitido para reservas de evento.").format(item_code_input))
+				frappe.throw(
+					frappe._("El producto {0} no está permitido para reservas de evento.").format(
+						item_code_input
+					)
+				)
 			item_data = frappe.db.get_value(
 				"Item", item_code_input, ["name", "standard_rate", "disabled"], as_dict=True
 			)
@@ -1918,7 +2015,9 @@ def create_event_booking(
 				{
 					"item_code": item_code_input,
 					"qty": float(it.get("qty", 1)),
-					"rate": float(item_data.standard_rate if item_data.standard_rate is not None else it.get("rate", 0)),
+					"rate": float(
+						item_data.standard_rate if item_data.standard_rate is not None else it.get("rate", 0)
+					),
 					"warehouse": warehouse,
 					"delivery_date": delivery_date,
 				},
@@ -1927,8 +2026,13 @@ def create_event_booking(
 		so.insert(ignore_permissions=True)
 		so.submit()
 
+		reservation = _create_event_reservation_from_sales_order(so, item_code)
+
 		# 2. Registrar el anticipo cobrado (si es mayor a 0)
-		can_register_advance_payment = not is_guest_request and "System Manager" in frappe.get_roles(frappe.session.user)
+		can_register_advance_payment = not is_guest_request and "System Manager" in frappe.get_roles(
+			frappe.session.user
+		)
+		advance_paid = 0.0
 		if can_register_advance_payment and requested_advance_amount > 0:
 			from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
@@ -1947,12 +2051,25 @@ def create_event_booking(
 
 				pe.insert(ignore_permissions=True)
 				pe.submit()
+				reservation.db_set("payment_entry", pe.name)
+				reservation.db_set("advance_paid", requested_advance_amount)
+				reservation.db_set(
+					"outstanding_amount",
+					max(0.0, float(so.grand_total or 0.0) - float(requested_advance_amount)),
+				)
+				advance_paid = requested_advance_amount
 			except Exception as e:
 				# Registrar el error pero no tumbar la Sales Order ya confirmada
 				frappe.log_error(message=str(e), title="Error creando anticipo para Sales Order en Reserva")
 
 		frappe.db.commit()
-		return {"success": True, "sales_order": so.name, "advance_paid": requested_advance_amount}
+		return {
+			"success": True,
+			"sales_order": so.name,
+			"reservation": reservation.name,
+			"reservation_state": reservation.state,
+			"advance_paid": advance_paid,
+		}
 	except Exception:
 		frappe.db.rollback()
 		raise
@@ -2464,7 +2581,9 @@ def validate_wholesale_access(phone, pin):
 		return generic_error
 
 	token = secrets.token_urlsafe(24)
-	frappe.cache().set_value(_wholesale_session_cache_key(matching_customer.name), f"{token}:{int(time.time())}")
+	frappe.cache().set_value(
+		_wholesale_session_cache_key(matching_customer.name), f"{token}:{int(time.time())}"
+	)
 
 	return {
 		"success": True,
@@ -2476,7 +2595,9 @@ def validate_wholesale_access(phone, pin):
 
 
 @frappe.whitelist(allow_guest=True)
-def create_wholesale_order(items=None, metodo_pago=None, metodo_entrega=None, customer=None, wholesale_token=None):
+def create_wholesale_order(
+	items=None, metodo_pago=None, metodo_entrega=None, customer=None, wholesale_token=None
+):
 	config = frappe.get_cached_doc("SaaS Feature Config")
 	if not _wholesale_is_active(config):
 		return _wholesale_disabled_response()
@@ -2491,7 +2612,9 @@ def create_wholesale_order(items=None, metodo_pago=None, metodo_entrega=None, cu
 
 		profile_customer = profile.get("customer")
 		if customer and customer != profile_customer:
-			frappe.throw(frappe._("No tenés permisos para crear pedidos para otro cliente."), frappe.PermissionError)
+			frappe.throw(
+				frappe._("No tenés permisos para crear pedidos para otro cliente."), frappe.PermissionError
+			)
 		customer = profile_customer
 
 	if not user or user == "Guest":
@@ -2587,6 +2710,8 @@ def get_pending_wholesale_orders():
 			"docstatus": 1,
 			"status": ["not in", ["Completed", "Closed", "Cancelled"]],
 			"custom_metodo_pago": ["in", ["Transferencia", "Efectivo"]],
+			"per_billed": ["<", 100],
+			"per_delivered": ["<", 100],
 		},
 		fields=[
 			"name",
@@ -2618,6 +2743,146 @@ def get_pending_wholesale_orders():
 	return result
 
 
+def _require_wholesale_admin_access():
+	if not frappe.session.user or frappe.session.user == "Guest":
+		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+
+	if "System Manager" not in frappe.get_roles(frappe.session.user):
+		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
+
+
+def _get_wholesale_completed_order_tracking(order_name):
+	sales_invoice_name = ""
+	payment_entry_name = ""
+	invoice_status = ""
+	completed_on = ""
+	outstanding_amount = 0.0
+
+	sales_invoices = frappe.get_all(
+		"Sales Invoice Item",
+		filters={"sales_order": order_name},
+		pluck="parent",
+		limit=1,
+	)
+	if sales_invoices:
+		sales_invoice_name = sales_invoices[0]
+		invoice_status = frappe.db.get_value("Sales Invoice", sales_invoice_name, "status") or ""
+		completed_on = frappe.db.get_value("Sales Invoice", sales_invoice_name, "modified") or ""
+		outstanding_amount = float(
+			frappe.db.get_value("Sales Invoice", sales_invoice_name, "outstanding_amount") or 0.0
+		)
+
+		payment_entries = frappe.get_all(
+			"Payment Entry Reference",
+			filters={
+				"reference_doctype": "Sales Invoice",
+				"reference_name": sales_invoice_name,
+				"docstatus": ["!=", 2],
+			},
+			pluck="parent",
+			limit=1,
+		)
+		if payment_entries:
+			payment_entry_name = payment_entries[0]
+
+	return {
+		"sales_invoice": sales_invoice_name,
+		"payment_entry": payment_entry_name,
+		"invoice_status": invoice_status,
+		"completed_on": completed_on,
+		"outstanding_amount": outstanding_amount,
+	}
+
+
+def _get_wholesale_order_rows(orders, include_tracking=False):
+	result = []
+	for o in orders:
+		items = frappe.get_all(
+			"Sales Order Item",
+			filters={"parent": o.name},
+			fields=["item_code", "item_name", "qty", "rate", "amount"],
+			order_by="idx asc",
+		)
+		mobile_no = frappe.db.get_value("Customer", o.customer, "mobile_no") or ""
+		order_dict = o.copy()
+		order_dict["items"] = items
+		order_dict["contact_phone"] = mobile_no
+
+		if include_tracking:
+			order_dict.update(_get_wholesale_completed_order_tracking(o.name))
+
+		result.append(order_dict)
+
+	return result
+
+
+@frappe.whitelist()
+def get_completed_wholesale_orders(limit=50):
+	config = frappe.get_cached_doc("SaaS Feature Config")
+	if not _wholesale_is_active(config):
+		return []
+
+	setup_wholesale_custom_fields()
+	_require_wholesale_admin_access()
+
+	try:
+		limit = max(1, min(int(limit or 50), 100))
+	except Exception:
+		limit = 50
+
+	orders = frappe.get_all(
+		"Sales Order",
+		filters={
+			"docstatus": 1,
+			"custom_metodo_pago": ["in", ["Transferencia", "Efectivo"]],
+			"status": ["!=", "Cancelled"],
+		},
+		or_filters=[
+			{"status": ["in", ["Completed", "Closed"]]},
+			{"per_billed": [">=", 100]},
+			{"per_delivered": [">=", 100]},
+		],
+		fields=[
+			"name",
+			"customer",
+			"customer_name",
+			"transaction_date",
+			"delivery_date",
+			"grand_total",
+			"custom_metodo_pago",
+			"custom_metodo_entrega",
+			"status",
+			"modified",
+			"per_billed",
+			"per_delivered",
+		],
+		order_by="modified desc",
+		limit=limit,
+	)
+
+	return _get_wholesale_order_rows(orders, include_tracking=True)
+
+
+@contextmanager
+def _wholesale_completion_lock(sales_order_name, timeout_seconds=10):
+	lock_name = f"wholesale_order_completion:{sales_order_name}"
+	lock_result = frappe.db.sql("SELECT GET_LOCK(%s, %s)", (lock_name, timeout_seconds))
+	lock_acquired = bool(lock_result and lock_result[0][0] == 1)
+	if not lock_acquired:
+		frappe.throw(
+			frappe._("No se pudo asegurar el pedido mayorista. Intentá nuevamente."),
+			frappe.ValidationError,
+		)
+
+	try:
+		yield lock_name
+	finally:
+		try:
+			frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_name,))
+		except Exception:
+			pass
+
+
 @frappe.whitelist()
 def complete_wholesale_order(sales_order_name, register_payment=True, payment_mode="Cash", warehouse=None):
 	config = frappe.get_cached_doc("SaaS Feature Config")
@@ -2633,6 +2898,7 @@ def complete_wholesale_order(sales_order_name, register_payment=True, payment_mo
 	if not frappe.db.exists("Sales Order", sales_order_name):
 		frappe.throw(frappe._("El pedido {0} no existe.").format(sales_order_name))
 
+	allowed_wholesale_payment_modes = {"Transferencia", "Efectivo"}
 	so = frappe.get_doc("Sales Order", sales_order_name)
 	if so.docstatus != 1:
 		frappe.throw(
@@ -2644,54 +2910,96 @@ def complete_wholesale_order(sales_order_name, register_payment=True, payment_mo
 	frappe.db.commit()
 	frappe.db.begin()
 	try:
-		# 1. Crear Sales Invoice a partir del Sales Order
-		si = make_sales_invoice(sales_order_name)
-		si.update_stock = 1
-		si.posting_date = frappe.utils.today()
-		si.set_posting_time = 1
-		si.currency = so.currency
-		warehouse = warehouse or get_platform_distribution_warehouse()
+		with _wholesale_completion_lock(sales_order_name):
+			so = frappe.get_doc("Sales Order", sales_order_name)
+			if so.docstatus != 1:
+				frappe.throw(
+					frappe._("El pedido {0} debe estar confirmado antes de completarse.").format(
+						sales_order_name
+					)
+				)
 
-		# Asegurar que el almacén sea el correcto para todos los items
-		for item in si.items:
-			item.warehouse = warehouse
+			order_payment_mode = (getattr(so, "custom_metodo_pago", "") or "").strip()
+			order_status = (getattr(so, "status", "") or "").strip()
+			per_billed = float(getattr(so, "per_billed", 0) or 0)
+			per_delivered = float(getattr(so, "per_delivered", 0) or 0)
 
-		si.insert(ignore_permissions=True)
-		si.submit()
+			if order_payment_mode not in allowed_wholesale_payment_modes:
+				frappe.throw(
+					frappe._("El pedido {0} no tiene un método de pago mayorista válido.").format(
+						sales_order_name
+					)
+				)
 
-		# 2. Registrar el pago si se solicita
-		advance_paid = 0.0
-		if frappe.utils.cint(register_payment):
-			from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+			if (
+				order_status in {"Completed", "Closed", "Cancelled"}
+				or per_billed >= 100
+				or per_delivered >= 100
+			):
+				frappe.throw(
+					frappe._("El pedido {0} ya fue procesado o no está pendiente de completarse.").format(
+						sales_order_name
+					)
+				)
 
-			grand_total = float(si.grand_total)
-			pe = get_payment_entry("Sales Invoice", si.name, bank_amount=grand_total)
-			pe.mode_of_payment = payment_mode
-			pe.reference_no = f"Confirmacion Pedido Mayorista {sales_order_name}"
-			pe.reference_date = frappe.utils.today()
+			warehouse_name = warehouse or get_platform_distribution_warehouse()
+			_validate_platform_distribution_warehouse(warehouse_name, company_name=so.company)
+			should_register_payment = bool(frappe.utils.cint(register_payment))
 
-			pe.paid_to = get_platform_payment_account(payment_mode)
+			resolved_payment_mode = ""
+			paid_to_account = ""
+			if should_register_payment:
+				resolved_payment_mode, paid_to_account = ensure_platform_payment_mode(
+					payment_mode, company_name=so.company
+				)
 
-			pe.paid_amount = grand_total
-			pe.received_amount = grand_total
-			if pe.references:
-				pe.references[0].allocated_amount = grand_total
+			# 1. Crear Sales Invoice a partir del Sales Order
+			si = make_sales_invoice(sales_order_name)
+			si.update_stock = 1
+			si.posting_date = frappe.utils.today()
+			si.set_posting_time = 1
+			si.currency = so.currency
 
-			pe.insert(ignore_permissions=True)
-			pe.submit()
-			advance_paid = grand_total
+			# Asegurar que el almacén sea el correcto para todos los items
+			for item in si.items:
+				item.warehouse = warehouse_name
 
-		frappe.db.commit()
+			si.insert(ignore_permissions=True)
+			si.submit()
 
-		outstanding = float(frappe.db.get_value("Sales Invoice", si.name, "outstanding_amount") or 0.0)
+			# 2. Registrar el pago si se solicita
+			advance_paid = 0.0
+			if should_register_payment:
+				from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
-		return {
-			"success": True,
-			"sales_invoice": si.name,
-			"advance_paid": advance_paid,
-			"grand_total": float(si.grand_total),
-			"outstanding_amount": outstanding,
-		}
+				grand_total = float(si.grand_total)
+				pe = get_payment_entry("Sales Invoice", si.name, bank_amount=grand_total)
+				pe.mode_of_payment = resolved_payment_mode
+				pe.reference_no = f"Confirmacion Pedido Mayorista {sales_order_name}"
+				pe.reference_date = frappe.utils.today()
+
+				pe.paid_to = paid_to_account
+
+				pe.paid_amount = grand_total
+				pe.received_amount = grand_total
+				if pe.references:
+					pe.references[0].allocated_amount = grand_total
+
+				pe.insert(ignore_permissions=True)
+				pe.submit()
+				advance_paid = grand_total
+
+			frappe.db.commit()
+
+			outstanding = float(frappe.db.get_value("Sales Invoice", si.name, "outstanding_amount") or 0.0)
+
+			return {
+				"success": True,
+				"sales_invoice": si.name,
+				"advance_paid": advance_paid,
+				"grand_total": float(si.grand_total),
+				"outstanding_amount": outstanding,
+			}
 	except Exception as e:
 		frappe.db.rollback()
 		frappe.throw(frappe._("Error al completar el pedido: {0}").format(str(e)))
@@ -2764,81 +3072,116 @@ def cancel_wholesale_order(sales_order_name):
 		frappe.throw(frappe._("Error al cancelar el pedido: {0}").format(str(e)))
 
 
-@frappe.whitelist()
-def get_pending_event_bookings():
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+def _get_event_reservation_rows(states):
+	normalized_states = [str(state).strip() for state in (states or []) if str(state).strip()]
+	if not normalized_states:
+		normalized_states = ["Pending Confirmation", "Confirmed"]
 
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
-
-	config = frappe.get_cached_doc("SaaS Feature Config")
-	item_code = config.get("reservation_item_code") or "Carrito Paletero"
-
-	# Obtener IDs de Sales Orders que contienen el recurso reservado
-	orders_with_resource = frappe.get_all(
-		"Sales Order Item", filters={"item_code": item_code, "docstatus": 1}, fields=["parent"]
-	)
-	order_names = [o.parent for o in orders_with_resource]
-
-	if not order_names:
-		return []
-
-	# Obtener los Sales Orders correspondientes que sigan pendientes
-	orders = frappe.get_all(
-		"Sales Order",
-		filters={
-			"name": ["in", order_names],
-			"docstatus": 1,
-			"status": ["not in", ["Completed", "Closed", "Cancelled"]],
-		},
+	reservations = frappe.get_all(
+		"Event Cart Reservation",
+		filters={"state": ["in", normalized_states]},
 		fields=[
 			"name",
+			"sales_order",
 			"customer",
-			"customer_name",
-			"transaction_date",
-			"delivery_date",
+			"event_date",
+			"company",
 			"grand_total",
-			"status",
 			"advance_paid",
+			"outstanding_amount",
+			"assigned_cart_warehouse",
+			"reservation_item_code",
+			"state",
 		],
 		order_by="creation desc",
 	)
 
 	result = []
-	for o in orders:
-		items = frappe.get_all(
-			"Sales Order Item",
-			filters={"parent": o.name},
-			fields=["item_code", "item_name", "qty", "rate", "amount"],
+	for reservation in reservations:
+		reservation_doc = frappe.get_doc("Event Cart Reservation", reservation.name)
+		reservation_dict = frappe._dict(
+			{
+				"name": reservation_doc.name,
+				"sales_order": reservation_doc.sales_order,
+				"customer": reservation_doc.customer,
+				"customer_name": frappe.db.get_value("Customer", reservation_doc.customer, "customer_name")
+				or "",
+				"contact_phone": frappe.db.get_value("Customer", reservation_doc.customer, "mobile_no") or "",
+				"transaction_date": frappe.db.get_value(
+					"Sales Order", reservation_doc.sales_order, "transaction_date"
+				),
+				"delivery_date": reservation_doc.event_date,
+				"event_date": reservation_doc.event_date,
+				"company": reservation_doc.company,
+				"grand_total": float(reservation_doc.grand_total or 0.0),
+				"advance_paid": float(reservation_doc.advance_paid or 0.0),
+				"outstanding_amount": float(reservation_doc.outstanding_amount or 0.0),
+				"status": reservation_doc.state,
+				"state": reservation_doc.state,
+				"assigned_cart_warehouse": reservation_doc.assigned_cart_warehouse,
+				"reservation_item_code": reservation_doc.reservation_item_code,
+				"sales_invoice": getattr(reservation_doc, "sales_invoice", ""),
+				"payment_entry": getattr(reservation_doc, "payment_entry", ""),
+				"delivery_note": getattr(reservation_doc, "delivery_note", ""),
+				"cancel_reason": getattr(reservation_doc, "cancel_reason", ""),
+				"release_notes": getattr(reservation_doc, "release_notes", ""),
+			},
 		)
-		order_dict = o.copy()
-		order_dict["items"] = items
-		result.append(order_dict)
+		reservation_dict["items"] = [frappe._dict(item.as_dict()) for item in reservation_doc.items]
+		result.append(reservation_dict)
 
 	return result
 
 
 @frappe.whitelist()
-def get_event_warehouses():
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+def get_event_reservations(states=None):
+	_require_event_lifecycle_admin_access()
 
-	company = get_platform_company_name()
+	if isinstance(states, str):
+		try:
+			states = frappe.parse_json(states)
+		except Exception:
+			states = [states]
+	elif states is None:
+		states = ["Pending Confirmation", "Confirmed"]
+	elif not isinstance(states, (list, tuple, set)):
+		states = [states]
+
+	return _get_event_reservation_rows(states)
+
+
+@frappe.whitelist()
+def get_pending_event_bookings():
+	_require_event_lifecycle_admin_access()
+	return _get_event_reservation_rows(["Pending Confirmation"])
+
+
+@frappe.whitelist()
+def get_event_warehouses(company=None):
+	_require_event_lifecycle_admin_access()
+	warehouses = _get_allowed_event_warehouses(company_name=company)
+
+	return warehouses
+
+
+@frappe.whitelist()
+def get_event_reservation_production_demand(event_date, company=None):
+	_require_event_lifecycle_admin_access()
+	return _get_event_reservation_production_demand(event_date, company=company)
+
+
+def _get_allowed_event_warehouses(company_name=None):
+	company = (company_name or get_platform_company_name()).strip()
 	company_abbr = get_platform_company_abbr(company)
 	parent_group_name = f"Carritos de Eventos - {company_abbr}"
+	default_warehouse = get_platform_distribution_warehouse()
 
-	warehouses = [
-		{
-			"name": get_platform_distribution_warehouse(),
-			"warehouse_name": get_platform_distribution_warehouse(),
-		}
-	]
+	warehouses = [{"name": default_warehouse, "warehouse_name": default_warehouse}]
 
 	if frappe.db.exists("Warehouse", parent_group_name):
 		event_warehouses = frappe.get_all(
 			"Warehouse",
-			filters={"parent_warehouse": parent_group_name, "company": company, "disabled": 0},
+			filters={"parent_warehouse": parent_group_name, "company": company, "is_group": 0, "disabled": 0},
 			fields=["name", "warehouse_name"],
 		)
 		for w in event_warehouses:
@@ -2847,22 +3190,127 @@ def get_event_warehouses():
 	return warehouses
 
 
+def _validate_event_booking_warehouse(warehouse, company_name=None):
+	return validate_confirmed_allocation_warehouse(warehouse, company_name=company_name)
+
+
+def _resolve_event_lifecycle_company(reservation_company, sales_order_company, sales_order_name):
+	reservation_company = (reservation_company or "").strip()
+	sales_order_company = (sales_order_company or "").strip()
+	if reservation_company and sales_order_company and reservation_company != sales_order_company:
+		frappe.throw(
+			frappe._(
+				"La reserva {0} pertenece a la compañía {1}, pero el pedido {0} pertenece a la compañía {2}."
+			).format(sales_order_name, reservation_company, sales_order_company),
+			frappe.ValidationError,
+		)
+
+	return reservation_company or sales_order_company or get_platform_company_name()
+
+
+@contextmanager
+def _event_reservation_named_lock(lock_key, timeout_seconds=5):
+	lock_result = frappe.db.sql("SELECT GET_LOCK(%s, %s)", (lock_key, timeout_seconds))
+	acquired = bool(lock_result and frappe.utils.cint(lock_result[0][0]))
+	if not acquired:
+		frappe.throw(
+			frappe._("No se pudo bloquear la reserva de evento. Volvé a intentar."),
+			frappe.ValidationError,
+		)
+
+	try:
+		yield
+	finally:
+		try:
+			frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+		except Exception:
+			pass
+
+
+def _event_reservation_lock_key(operation, sales_order_name):
+	import hashlib
+
+	site = str(getattr(frappe.local, "site", "unknown-site") or "unknown-site")
+	identity = f"{site}:{sales_order_name}"
+	digest = hashlib.sha256(identity.encode()).hexdigest()[:32]
+	return f"event_reservation:{operation}:{digest}"
+
+
+def _save_event_reservation(reservation):
+	reservation.flags.event_reservation_service_operation = True
+	return reservation.save(ignore_permissions=True)
+
+
 @frappe.whitelist()
-def complete_event_booking(sales_order_name, register_payment=True, payment_mode="Cash", warehouse=None):
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+def confirm_event_reservation(sales_order_name, register_payment=True, payment_mode="Cash", warehouse=None):
+	_require_event_lifecycle_admin_access()
+	lock_key = _event_reservation_lock_key("lifecycle", sales_order_name)
+	with _event_reservation_named_lock(lock_key, timeout_seconds=10):
+		return _confirm_event_reservation_locked(
+			sales_order_name,
+			register_payment=register_payment,
+			payment_mode=payment_mode,
+			warehouse=warehouse,
+		)
 
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
 
-	if not frappe.db.exists("Sales Order", sales_order_name):
-		frappe.throw(frappe._("La reserva {0} no existe.").format(sales_order_name))
+def _confirm_event_reservation_locked(
+	sales_order_name, register_payment=True, payment_mode="Cash", warehouse=None
+):
+	reservation = _get_event_reservation(sales_order_name)
+	if reservation.state == "Released":
+		frappe.throw(
+			frappe._("La reserva {0} ya fue liberada y no puede confirmarse otra vez.").format(
+				sales_order_name
+			)
+		)
+
+	if reservation.state == "Cancelled":
+		frappe.throw(frappe._("La reserva {0} ya fue cancelada.").format(sales_order_name))
 
 	so = frappe.get_doc("Sales Order", sales_order_name)
 	if so.docstatus != 1:
 		frappe.throw(
 			frappe._("La reserva {0} debe estar confirmada antes de completarse.").format(sales_order_name)
 		)
+
+	company_name = _resolve_event_lifecycle_company(reservation.company, so.company, sales_order_name)
+	should_register_payment = bool(frappe.utils.cint(register_payment))
+	if not should_register_payment:
+		frappe.throw(
+			frappe._(
+				"La confirmación de reservas requiere registrar el pago; no se admite register_payment=0."
+			),
+			frappe.ValidationError,
+		)
+
+	if reservation.state == "Confirmed" and reservation.sales_invoice:
+		if reservation.assigned_cart_warehouse:
+			_validate_event_booking_warehouse(reservation.assigned_cart_warehouse, company_name=company_name)
+		return {
+			"success": True,
+			"sales_order": reservation.sales_order,
+			"reservation": reservation.name,
+			"reservation_state": reservation.state,
+			"sales_invoice": reservation.sales_invoice,
+			"payment_entry": reservation.payment_entry,
+			"grand_total": float(reservation.grand_total or 0.0),
+			"advance_paid": float(reservation.advance_paid or 0.0),
+			"outstanding_amount": float(reservation.outstanding_amount or 0.0),
+			"assigned_cart_warehouse": reservation.assigned_cart_warehouse,
+		}
+
+	payment_account = None
+
+	warehouse = warehouse or get_platform_distribution_warehouse()
+	warehouse = _validate_event_booking_warehouse(warehouse, company_name=company_name)
+
+	expected_payment_amount = max(
+		float(getattr(so, "grand_total", 0.0) or 0.0),
+		float(getattr(so, "outstanding_amount", 0.0) or 0.0),
+	)
+	if expected_payment_amount > 0:
+		payment_account = get_platform_payment_account(payment_mode)
 
 	from erpnext.selling.doctype.sales_order.sales_order import make_sales_invoice
 
@@ -2871,28 +3319,18 @@ def complete_event_booking(sales_order_name, register_payment=True, payment_mode
 	try:
 		# 1. Crear Sales Invoice a partir del Sales Order
 		si = make_sales_invoice(sales_order_name)
-		si.update_stock = 1
+		si.update_stock = 0
 		si.posting_date = frappe.utils.today()
 		si.set_posting_time = 1
 		si.currency = so.currency
-		warehouse = warehouse or get_platform_distribution_warehouse()
-
-		config = frappe.get_cached_doc("SaaS Feature Config")
-		item_code = config.get("reservation_item_code") or "Carrito Paletero"
-
-		# Asegurar que el almacén sea el correcto para todos los items
-		# Y filtrar/remover el recurso reservado de la factura para evitar salidas de stock del activo físico
-		si.items = [item for item in si.items if item.item_code != item_code]
-		for item in si.items:
-			item.warehouse = warehouse
-
 		si.insert(ignore_permissions=True)
 		si.submit()
 
 		# 2. Registrar el pago si se solicita, considerando la diferencia restante
 		advance_paid = 0.0
 		outstanding = float(si.outstanding_amount)
-		if frappe.utils.cint(register_payment) and outstanding > 0:
+		pe = None
+		if outstanding > 0:
 			from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
 			pe = get_payment_entry("Sales Invoice", si.name, bank_amount=outstanding)
@@ -2900,7 +3338,7 @@ def complete_event_booking(sales_order_name, register_payment=True, payment_mode
 			pe.reference_no = f"Confirmacion Reserva Evento {sales_order_name}"
 			pe.reference_date = frappe.utils.today()
 
-			pe.paid_to = get_platform_payment_account(payment_mode)
+			pe.paid_to = payment_account
 
 			pe.paid_amount = outstanding
 			pe.received_amount = outstanding
@@ -2911,8 +3349,21 @@ def complete_event_booking(sales_order_name, register_payment=True, payment_mode
 			pe.submit()
 			advance_paid = outstanding
 
-		# 3. Cerrar el Sales Order de la reserva para liberar el carrito
-		so.db_set("status", "Completed")
+		reservation.assigned_cart_warehouse = warehouse
+		reservation.sales_invoice = si.name
+		reservation.payment_entry = pe.name if pe else reservation.payment_entry
+		reservation.grand_total = float(si.grand_total or 0.0)
+		reservation.base_grand_total = float(
+			getattr(si, "base_grand_total", si.grand_total) or si.grand_total or 0.0
+		)
+		reservation.advance_paid = advance_paid
+		reservation.outstanding_amount = float(
+			frappe.db.get_value("Sales Invoice", si.name, "outstanding_amount") or 0.0
+		)
+		reservation.state = "Confirmed"
+		reservation.confirmed_at = frappe.utils.now_datetime()
+		reservation.confirmed_by = frappe.session.user
+		_save_event_reservation(reservation)
 		frappe.db.commit()
 
 		updated_outstanding = float(
@@ -2921,10 +3372,15 @@ def complete_event_booking(sales_order_name, register_payment=True, payment_mode
 
 		return {
 			"success": True,
+			"sales_order": so.name,
+			"reservation": reservation.name,
+			"reservation_state": reservation.state,
 			"sales_invoice": si.name,
+			"payment_entry": pe.name if pe else reservation.payment_entry,
 			"advance_paid": advance_paid,
 			"grand_total": float(si.grand_total),
 			"outstanding_amount": updated_outstanding,
+			"assigned_cart_warehouse": reservation.assigned_cart_warehouse,
 		}
 	except Exception as e:
 		frappe.db.rollback()
@@ -2932,28 +3388,343 @@ def complete_event_booking(sales_order_name, register_payment=True, payment_mode
 
 
 @frappe.whitelist()
-def cancel_event_booking(sales_order_name):
-	if not frappe.session.user or frappe.session.user == "Guest":
-		frappe.throw(frappe._("Iniciá sesión para continuar"), frappe.PermissionError)
+def complete_event_booking(sales_order_name, register_payment=True, payment_mode="Cash", warehouse=None):
+	return confirm_event_reservation(
+		sales_order_name,
+		register_payment=register_payment,
+		payment_mode=payment_mode,
+		warehouse=warehouse,
+	)
 
-	if "System Manager" not in frappe.get_roles(frappe.session.user):
-		frappe.throw(frappe._("No tenés permisos para acceder a este recurso."), frappe.PermissionError)
 
-	if not frappe.db.exists("Sales Order", sales_order_name):
-		frappe.throw(frappe._("La reserva {0} no existe.").format(sales_order_name))
+def _get_event_payment_entry_names(reference_doctypes, reference_names):
+	rows = frappe.get_all(
+		"Payment Entry Reference",
+		filters={
+			"reference_doctype": ["in", list(reference_doctypes)],
+			"reference_name": ["in", list(reference_names)],
+			"docstatus": 1,
+		},
+		fields=["parent"],
+	)
+	return sorted({row.get("parent") for row in rows if row.get("parent")})
 
-	frappe.db.commit()
-	frappe.db.begin()
-	try:
-		_cancel_sales_order_transaction_chain(sales_order_name)
-		frappe.db.commit()
+
+def _payment_amount(payment, payment_type):
+	fieldname = "received_amount" if payment_type == "Receive" else "paid_amount"
+	return abs(frappe.utils.flt(payment.get(fieldname) or 0, 2))
+
+
+def _validate_event_payment_identity(payment, original_invoice, payment_type):
+	currency_field = "paid_to_account_currency" if payment_type == "Receive" else "paid_from_account_currency"
+	if (
+		payment.docstatus != 1
+		or payment.get("payment_type") != payment_type
+		or payment.get("party_type") != "Customer"
+		or payment.get("party") != original_invoice.customer
+		or payment.get("company") != original_invoice.company
+		or payment.get(currency_field) != original_invoice.currency
+	):
+		frappe.throw(
+			frappe._(
+				"Un Payment Entry vinculado no coincide con el cliente, compañía o moneda de la reserva."
+			),
+			frappe.ValidationError,
+		)
+
+
+def _validate_payment_reference_amount(payment, allowed_references, expected_amount):
+	matching_references = [
+		reference
+		for reference in (payment.get("references") or [])
+		if (reference.reference_doctype, reference.reference_name) in allowed_references
+	]
+	if len(matching_references) != 1:
+		frappe.throw(
+			frappe._("Cada Payment Entry debe tener una única referencia contable a esta reserva."),
+			frappe.ValidationError,
+		)
+
+	allocated_amount = abs(frappe.utils.flt(matching_references[0].allocated_amount or 0, 2))
+	if allocated_amount != expected_amount:
+		frappe.throw(
+			frappe._("El importe asignado del Payment Entry no coincide con su importe pagado."),
+			frappe.ValidationError,
+		)
+
+
+def _validate_submitted_event_reversals(reservation):
+	if not reservation.sales_invoice:
+		frappe.throw(
+			frappe._("La reserva confirmada no tiene una factura original vinculada."),
+			frappe.ValidationError,
+		)
+
+	original_invoice = frappe.get_doc("Sales Invoice", reservation.sales_invoice)
+	if original_invoice.docstatus != 1:
+		frappe.throw(
+			frappe._("La factura original de la reserva debe estar enviada."),
+			frappe.ValidationError,
+		)
+	credit_note_name = str(reservation.get("credit_note") or "").strip()
+	if not credit_note_name:
+		frappe.throw(
+			frappe._("Vinculá una nota de crédito enviada antes de cancelar la reserva."),
+			frappe.ValidationError,
+		)
+
+	credit_note = frappe.get_doc("Sales Invoice", credit_note_name)
+	credit_note_amount = abs(frappe.utils.flt(credit_note.grand_total or 0, 2))
+	original_amount = abs(frappe.utils.flt(original_invoice.grand_total or 0, 2))
+	if (
+		credit_note.docstatus != 1
+		or not credit_note.get("is_return")
+		or credit_note.get("return_against") != original_invoice.name
+		or credit_note.company != original_invoice.company
+		or credit_note.customer != original_invoice.customer
+		or credit_note.currency != original_invoice.currency
+		or credit_note_amount != original_amount
+	):
+		frappe.throw(
+			frappe._("La nota de crédito vinculada no revierte íntegramente la factura de la reserva."),
+			frappe.ValidationError,
+		)
+
+	original_references = {
+		("Sales Order", reservation.sales_order),
+		("Sales Invoice", original_invoice.name),
+	}
+	original_payment_names = _get_event_payment_entry_names(
+		("Sales Order", "Sales Invoice"),
+		(reservation.sales_order, original_invoice.name),
+	)
+	stored_original_payment = str(reservation.get("payment_entry") or "").strip()
+	if stored_original_payment and stored_original_payment not in original_payment_names:
+		frappe.throw(
+			frappe._("El Payment Entry guardado no tiene una referencia contable válida a la reserva."),
+			frappe.ValidationError,
+		)
+
+	original_payments = []
+	total_paid = 0.0
+	for payment_name in original_payment_names:
+		payment = frappe.get_doc("Payment Entry", payment_name)
+		_validate_event_payment_identity(payment, original_invoice, "Receive")
+		amount = _payment_amount(payment, "Receive")
+		_validate_payment_reference_amount(payment, original_references, amount)
+		original_payments.append(payment)
+		total_paid += amount
+
+	if not original_payments:
+		if original_amount:
+			frappe.throw(
+				frappe._("No se encontraron pagos enviados vinculados a la reserva confirmada."),
+				frappe.ValidationError,
+			)
+		return credit_note, [], [], 0.0
+
+	refund_payment_names = _get_event_payment_entry_names(("Sales Invoice",), (credit_note.name,))
+	stored_refund = str(reservation.get("refund_payment_entry") or "").strip()
+	if stored_refund and stored_refund not in refund_payment_names:
+		frappe.throw(
+			frappe._("El Payment Entry de reembolso guardado no referencia la nota de crédito."),
+			frappe.ValidationError,
+		)
+
+	refund_payments = []
+	total_refunded = 0.0
+	refund_reference = {("Sales Invoice", credit_note.name)}
+	for payment_name in refund_payment_names:
+		refund = frappe.get_doc("Payment Entry", payment_name)
+		_validate_event_payment_identity(refund, original_invoice, "Pay")
+		amount = _payment_amount(refund, "Pay")
+		_validate_payment_reference_amount(refund, refund_reference, amount)
+		refund_payments.append(refund)
+		total_refunded += amount
+
+	total_paid = frappe.utils.flt(total_paid, 2)
+	total_refunded = frappe.utils.flt(total_refunded, 2)
+	if total_refunded != total_paid:
+		frappe.throw(
+			frappe._("Los reembolsos enviados deben cubrir todos los pagos cobrados para la reserva."),
+			frappe.ValidationError,
+		)
+
+	return credit_note, original_payments, refund_payments, total_refunded
+
+
+@frappe.whitelist()
+def cancel_event_reservation(
+	sales_order_name,
+	refund_evidence=None,
+	reversal_evidence=None,
+	cancel_reason=None,
+	credit_note=None,
+	refund_payment_entry=None,
+):
+	_require_event_lifecycle_admin_access()
+	if any(str(value or "").strip() for value in (refund_evidence, reversal_evidence)):
+		frappe.throw(
+			frappe._(
+				"El texto libre no constituye evidencia contable. Vinculá documentos de reversión enviados."
+			),
+			frappe.ValidationError,
+		)
+
+	lock_key = _event_reservation_lock_key("lifecycle", sales_order_name)
+	with _event_reservation_named_lock(lock_key, timeout_seconds=10):
+		reservation = _get_event_reservation(sales_order_name)
+		if reservation.state == "Released":
+			frappe.throw(frappe._("Las reservas liberadas no se pueden cancelar."))
+
+		if reservation.state == "Cancelled":
+			return {
+				"success": True,
+				"reservation": reservation.name,
+				"reservation_state": reservation.state,
+				"message": frappe._("La reserva ya estaba cancelada."),
+			}
+
+		if reservation.state == "Confirmed":
+			reservation.credit_note = credit_note or reservation.credit_note
+			reservation.refund_payment_entry = refund_payment_entry or reservation.refund_payment_entry
+			credit_note, _original_payments, refunds, total_refunded = _validate_submitted_event_reversals(
+				reservation
+			)
+			reservation.credit_note_amount = abs(float(credit_note.grand_total or 0))
+			reservation.refund_amount = total_refunded
+			if refunds and not reservation.refund_payment_entry:
+				reservation.refund_payment_entry = refunds[0].name
+		else:
+			_cancel_sales_order_transaction_chain(sales_order_name)
+
+		reservation.state = "Cancelled"
+		reservation.cancel_reason = cancel_reason or reservation.cancel_reason
+		reservation.cancelled_at = frappe.utils.now_datetime()
+		reservation.cancelled_by = frappe.session.user
+		_save_event_reservation(reservation)
 		return {
 			"success": True,
+			"reservation": reservation.name,
+			"reservation_state": reservation.state,
 			"message": frappe._("Reserva cancelada correctamente y el historial contable se conservó."),
 		}
-	except Exception as e:
-		frappe.db.rollback()
-		frappe.throw(frappe._("Error al cancelar la reserva: {0}").format(str(e)))
+
+
+@frappe.whitelist()
+def cancel_event_booking(
+	sales_order_name,
+	refund_evidence=None,
+	reversal_evidence=None,
+	cancel_reason=None,
+	credit_note=None,
+	refund_payment_entry=None,
+):
+	return cancel_event_reservation(
+		sales_order_name,
+		refund_evidence=refund_evidence,
+		reversal_evidence=reversal_evidence,
+		cancel_reason=cancel_reason,
+		credit_note=credit_note,
+		refund_payment_entry=refund_payment_entry,
+	)
+
+
+@frappe.whitelist()
+def release_event_reservation(sales_order_name, release_notes=None):
+	_require_event_lifecycle_admin_access()
+
+	lock_key = f"event_cart_reservation_release:{sales_order_name}"
+	with _event_reservation_named_lock(lock_key):
+		reservation = _get_event_reservation(sales_order_name)
+		if reservation.state == "Cancelled":
+			frappe.throw(frappe._("Las reservas canceladas no se pueden liberar."))
+
+		so = frappe.get_doc("Sales Order", sales_order_name)
+		if so.docstatus != 1:
+			frappe.throw(
+				frappe._("La reserva {0} debe estar confirmada antes de liberarse.").format(sales_order_name)
+			)
+
+		company_name = _resolve_event_lifecycle_company(reservation.company, so.company, sales_order_name)
+		if not reservation.assigned_cart_warehouse:
+			frappe.throw(
+				frappe._("Las reservas confirmadas requieren un almacén asignado antes de liberarse.")
+			)
+		_validate_event_booking_warehouse(reservation.assigned_cart_warehouse, company_name=company_name)
+
+		if reservation.delivery_note and reservation.state == "Released":
+			return {
+				"success": True,
+				"reservation": reservation.name,
+				"reservation_state": reservation.state,
+				"delivery_note": reservation.delivery_note,
+				"message": frappe._("La reserva ya estaba liberada."),
+			}
+
+		if reservation.delivery_note and reservation.state != "Released":
+			reservation.state = "Released"
+			reservation.release_notes = release_notes or reservation.release_notes
+			reservation.released_at = frappe.utils.now_datetime()
+			reservation.released_by = frappe.session.user
+			_save_event_reservation(reservation)
+			frappe.db.commit()
+			return {
+				"success": True,
+				"reservation": reservation.name,
+				"reservation_state": reservation.state,
+				"delivery_note": reservation.delivery_note,
+				"message": frappe._("La reserva ya tenía un Delivery Note asociado."),
+			}
+
+		if reservation.state != "Confirmed":
+			frappe.throw(frappe._("Solo las reservas confirmadas pueden liberarse."))
+
+		config = frappe.get_cached_doc("SaaS Feature Config")
+		reservation_item_code = (
+			reservation.reservation_item_code or config.get("reservation_item_code") or "Carrito Paletero"
+		)
+
+		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+
+		frappe.db.commit()
+		frappe.db.begin()
+		try:
+			dn = make_delivery_note(sales_order_name)
+			dn.items = [item for item in dn.items if item.item_code != reservation_item_code]
+			if not dn.items:
+				frappe.throw(frappe._("No hay artículos facturables para liberar la reserva."))
+
+			for item in dn.items:
+				item.warehouse = reservation.assigned_cart_warehouse
+
+			dn.insert(ignore_permissions=True)
+			dn.submit()
+
+			reservation.delivery_note = dn.name
+			reservation.state = "Released"
+			reservation.release_notes = release_notes or reservation.release_notes
+			reservation.released_at = frappe.utils.now_datetime()
+			reservation.released_by = frappe.session.user
+			_save_event_reservation(reservation)
+			frappe.db.commit()
+
+			return {
+				"success": True,
+				"reservation": reservation.name,
+				"reservation_state": reservation.state,
+				"delivery_note": dn.name,
+				"assigned_cart_warehouse": reservation.assigned_cart_warehouse,
+				"message": frappe._("Reserva liberada correctamente."),
+			}
+		except Exception as e:
+			frappe.db.rollback()
+			frappe.throw(frappe._("Error al liberar la reserva: {0}").format(str(e)))
+
+
+@frappe.whitelist()
+def release_event_booking(sales_order_name, release_notes=None):
+	return release_event_reservation(sales_order_name, release_notes=release_notes)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3461,7 +4232,9 @@ def _ensure_mexican_tax_account(account_label, company_name, company_abbr, paren
 	return doc.name
 
 
-def _ensure_mexican_tax_template(doctype, template_name, company_name, company_abbr, account_head, description):
+def _ensure_mexican_tax_template(
+	doctype, template_name, company_name, company_abbr, account_head, description
+):
 	if not account_head:
 		frappe.logger("paletixa_saas").warning(
 			frappe._("Se omitió la plantilla {0} porque no existe una cuenta contable válida.").format(
@@ -5703,7 +6476,9 @@ def _tenant_workspace_availability(workspace_id):
 		return {
 			"available": False,
 			"reason": "invalid",
-			"message": frappe._("El Workspace ID ingresado es inválido. Solo se admiten letras, números y guiones."),
+			"message": frappe._(
+				"El Workspace ID ingresado es inválido. Solo se admiten letras, números y guiones."
+			),
 			"workspace_id": workspace_id,
 		}
 
@@ -5927,49 +6702,65 @@ def _get_tenant_status_impl(subdomain, token=None, workspace_id=None):
 		site_name = f"{workspace_id}.{base_domain}"
 		site_path = os.path.join(get_sites_path(), site_name)
 		if not os.path.exists(site_path):
-			response.update({
-				"phase": "creating_site",
-				"progress": 25,
-				"message": frappe._("Creando la base de datos y preparando el sitio..."),
-			})
+			response.update(
+				{
+					"phase": "creating_site",
+					"progress": 25,
+					"message": frappe._("Creando la base de datos y preparando el sitio..."),
+				}
+			)
 		else:
 			try:
 				with SafeSiteContext(site_name):
 					company_exists = bool(frappe.db.count("Company") > 0)
-					admin_email = frappe.db.get_value("SaaS Tenant Request", {"subdomain": workspace_id}, "admin_email")
+					admin_email = frappe.db.get_value(
+						"SaaS Tenant Request", {"subdomain": workspace_id}, "admin_email"
+					)
 					if not company_exists:
-						response.update({
-							"phase": "installing_apps",
-							"progress": 55,
-							"message": frappe._("Instalando módulos y apps de ERPNext..."),
-						})
+						response.update(
+							{
+								"phase": "installing_apps",
+								"progress": 55,
+								"message": frappe._("Instalando módulos y apps de ERPNext..."),
+							}
+						)
 					elif admin_email and not frappe.db.exists("User", admin_email):
-						response.update({
-							"phase": "configuring_identity",
-							"progress": 80,
-							"message": frappe._("Configurando identidad y datos requeridos del tenant..."),
-						})
+						response.update(
+							{
+								"phase": "configuring_identity",
+								"progress": 80,
+								"message": frappe._(
+									"Configurando identidad y datos requeridos del tenant..."
+								),
+							}
+						)
 					else:
 						try:
 							validate_tenant_runtime_config()
 						except frappe.ValidationError as ex:
-							response.update({
-								"phase": "configuring_runtime",
-								"progress": 90,
-								"message": str(ex),
-							})
+							response.update(
+								{
+									"phase": "configuring_runtime",
+									"progress": 90,
+									"message": str(ex),
+								}
+							)
 						else:
-							response.update({
-								"phase": "configuring_runtime",
-								"progress": 95,
-								"message": frappe._("Validando la configuración requerida del tenant..."),
-							})
+							response.update(
+								{
+									"phase": "configuring_runtime",
+									"progress": 95,
+									"message": frappe._("Validando la configuración requerida del tenant..."),
+								}
+							)
 			except Exception:
-				response.update({
-					"phase": "installing_apps",
-					"progress": 55,
-					"message": frappe._("Instalando módulos y apps de ERPNext..."),
-				})
+				response.update(
+					{
+						"phase": "installing_apps",
+						"progress": 55,
+						"message": frappe._("Instalando módulos y apps de ERPNext..."),
+					}
+				)
 	elif status == "Completed":
 		response.update({"phase": "completed", "progress": 100, "message": frappe._("¡Despliegue exitoso!")})
 
@@ -6124,7 +6915,9 @@ def validate_tenant_runtime_config(config=None):
 
 	if missing_links:
 		frappe.throw(
-			frappe._("La configuración runtime todavía no está completa: {0}.").format(", ".join(missing_links)),
+			frappe._("La configuración runtime todavía no está completa: {0}.").format(
+				", ".join(missing_links)
+			),
 			frappe.ValidationError,
 		)
 
@@ -6143,7 +6936,6 @@ def provision_tenant_task(request_id, base_domain="localhost"):
 	import json
 	import os
 	import subprocess
-	import traceback
 
 	doc = frappe.get_doc("SaaS Tenant Request", request_id)
 	doc.status = "In Progress"
@@ -6475,7 +7267,7 @@ def _build_platform_dashboard_row_from_site(site_name, database_name=""):
 
 			row = _populate_platform_dashboard_metrics(row, site_name)
 	except Exception as ex:
-			row["error"] = str(ex)
+		row["error"] = str(ex)
 
 	return row
 
